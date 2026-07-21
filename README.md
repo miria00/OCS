@@ -36,7 +36,7 @@ $l_i \in \mathbf{R}^{m_i}$, and linear operators $K_i : \mathbf{R}^n \to \mathbf
 This form covers linear, quadratic, and second-order-cone programs, as well as
 imaging, total-variation, optimal-transport, and matrix-variable problems.
 
-What makes OCS *operator-native* is the contract on $K_i$: it is supplied only as
+What makes OCS operator-native is the contract on $K_i$: it is supplied only as
 a pair of functions,
 
 $$
@@ -55,7 +55,7 @@ metric-scaled (scalar / diagonal / matrix); see
 The whole solve runs on one adaptive-restart PDHG engine in float32, to a 1e-3
 relative residual, and is `jax.vmap`-batched over instances.
 
-## Usage — two entry points
+## Usage: two entry points
 
 OCS has exactly two ways in:
 
@@ -67,7 +67,7 @@ OCS has exactly two ways in:
    solves the same small problem with OCS and with SCS/Clarabel and compares. Use
    it to gain trust before scaling up. It is *not* part of the core solver.
 
-### Entry point 1 — solve at scale
+### Entry point 1: solve at scale
 
 Compressed-sensing LASSO with a subsampled-FFT operator,
 
@@ -111,7 +111,7 @@ Run it with `python examples/hello_world.py`. This is the regime where a
 formed-matrix GPU solver would need the explicit `M F` (impossible at scale) — see
 the wedge figures in [`plots/`](plots/).
 
-### Entry point 2 — sanity-check against CVXPY
+### Entry point 2: sanity-check against CVXPY
 
 ```python
 from ocs.cvxpy_harness import validate_against_cvxpy
@@ -162,8 +162,8 @@ land in [`plots/`](plots/); [`plots/README.md`](plots/README.md) captions each o
   PDHG setting — projected SGD over row/column log-scalings from `matvec`/`rmatvec`
   only. Robust orders-of-magnitude win on ill-conditioned operators, harmless on
   well-conditioned ones.
-- **The prox library is the centerpiece,** organized as a system: POGS-style
-  calculus, a declared scaling tier per block, the LP/QP/SOCP cone set plus
+- **The prox library,** organized as a system: POGS-style,
+  a declared scaling tier per block, the LP/QP/SOCP cone set plus
   PSD / exp / power (public term builders `soc`/`psd`/`exp_cone`/`pow_cone`), the
   regression losses (`pinball`/`quantile`, `logistic`), piecewise-linear convex
   costs (`pwl`, for concave-utility / congestion problems), and type-grouped GPU
