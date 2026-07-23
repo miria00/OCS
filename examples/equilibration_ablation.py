@@ -1,4 +1,4 @@
-"""Matrix-free equilibration -- scalar vs Diamond-Boyd SMFE, on TWO ill-conditioned
+"""Matrix-free equilibration: scalar vs Diamond-Boyd SMFE, on two ill-conditioned
 operator families, to show the win is not specific to one problem.
 
   (A) column-scaled dense NNLS:  min 1/2||A x - b||^2 s.t. x>=0, A = G diag(s),

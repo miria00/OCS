@@ -1,48 +1,44 @@
-# Prox libraries — inventory, GPU status, and how OCS organizes its own
+# Prox libraries: inventory, GPU status, and how OCS organizes them
 
-Stephen's ask: *don't just list prox functions.* First, what already exists and
-which are GPU; then organize the library as a system with a clean statement of
-what each block can compute.
 
 ## What already exists
 
-| library | language | GPU? | autodiff? | cone coverage |
+| library | language | GPU | autodiff | cone coverage |
 |---|---|---|---|---|
 | ProximalOperators.jl | Julia | no | no | broad (norms, cones, indicators) |
 | pyproximal (PyLops) | Python | partial (CuPy) | no | moderate |
 | TFOCS | MATLAB | no | no | moderate |
 | Proximity Operator Repository (Chierchia) | MATLAB | no | no | catalog, broad |
-| Parikh–Boyd reference code | MATLAB/Python | no | no | teaching set |
-| **POGS** (Fougner–Boyd) | C++/CUDA | **yes** | no | separable funcs + calculus |
-| **ProxImaL** (Heide … Boyd, 2016) | Python + **Halide** | **yes** | no | imaging proxes/operators |
-| cone projections inside SCS / COSMO / Clarabel | C/Rust | SCS/cuClarabel yes | no | full cone set, bundled in a solver |
-| torch/JAX ad-hoc (`relu`, soft-threshold, …) | Python | yes | yes | orthant / box / norm balls only |
+| Parikh-Boyd reference code | MATLAB/Python | no | no | teaching set |
+| **POGS** (Fougner-Boyd) | C++/CUDA | **yes** | no | separable funcs + calculus |
+| **ProxImaL** | Python + **Halide** | **yes** | no | imaging proxes/operators |
+| cone projections inside SCS / COSMO / Clarabel | C/Rust | cuClarabel yes | no | full cone set, bundled in a solver |
+| torch/JAX ad-hoc (`relu`, soft-threshold, etc) | Python | yes | yes | orthant / box / norm balls only |
 
-**Reading of the landscape.** Coverage and GPU support are negatively correlated.
-The *simple* projections (nonnegative orthant = a ReLU, box, norm balls) are
-already GPU-native and differentiable in array frameworks. The *harder* cone
+**Reading of the landscape.** 
+The simple projections (nonnegative orthant = a ReLU, box, norm balls) are
+already GPU-native and differentiable in array frameworks. The harder cone
 projections (second-order, semidefinite, exponential, power) exist only inside
-CPU solvers or, on GPU, bundled inside a complete solver — not exposed as
+CPU solvers or, bundled inside a complete system, not exposed as
 standalone, composable, GPU-native, differentiable operators.
 
-**Halide / ProxImaL** is the GPU prox work Stephen remembers: Heide, Diamond,
-Nießner, Ragan-Kelley, Heidrich, Wetzstein, *ProxImaL* (SIGGRAPH 2016) compiled
+**Halide / ProxImaL** is the GPU prox work with compiled
 proxes + linear operators to fast CPU/GPU code via Halide. It is imaging-focused,
 not a general cone library, and Halide codegen is heavy to maintain.
 
-**POGS** (Fougner & Boyd) is the model to follow for *organization*: every block
+**POGS** is the model we follow for organization: every block
 is stored as a transform of a small base prox, so a linear and quadratic term is
 added to any prox automatically.
 
-**The gap OCS fills:** a modern GPU-native, autodiff-friendly, *composable* prox
+**The gap OCS covers:** a modern GPU-native, autodiff-friendly, composable prox
 library that covers the LP/QP/SOCP cone set (plus PSD / exp / power), organized by
 a calculus and a scaling contract, with type-grouped GPU dispatch.
 
 ## How OCS organizes its library
 
-Not a list — a small set of base blocks, a **calculus** that augments any block,
-a **scaling contract** that states exactly what metric each block admits, and a
-**grouped GPU dispatch** so a heterogeneous list of blocks evaluates as one
+Not a list: a small set of base blocks, a calculus that augments any block,
+a scaling contract that states exactly what metric each block admits, and a
+grouped GPU dispatch so a heterogeneous list of blocks evaluates as one
 batched dispatch per type.
 
 | block | base prox | auto lin/quad aug. | scaling class | eval kind | grouped dispatch key |
@@ -71,10 +67,10 @@ batched dispatch per type.
   dispatch (`prox/groups.py`); see `examples/bench_grouped_prox.py` for the
   measured payoff (flat in the number of blocks).
 
-## Public vs experimental (v1)
+## V1 status
 
 - **Headline / validated:** affine, box, nonnegative, equality, `L1`, `L2`,
-  least-squares, **SOCP** — plus the LP/QP/SOCP path validated against SCS.
+  least-squares, **SOCP**, plus the LP/QP/SOCP path validated against SCS.
 - **Present, experimental:** `PSDCone`, `ExpCone`, `PowerCone`, and the full
-  *matrix* scaling tier — implemented and unit-tested (feasible + idempotent),
+  matrix scaling tier, implemented and unit-tested (feasible + idempotent),
   not yet benchmarked at scale or wired into the CVXPY translation.

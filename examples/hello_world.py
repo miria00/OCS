@@ -1,8 +1,8 @@
-"""OCS hello world -- the two entry points.
+"""OCS hello world: the two entry points.
 
   Entry 2 (trust):  sanity-check a SMALL problem against CVXPY (OCS vs SCS).
-  Entry 1 (scale):  solve the real thing -- one fixed matrix-free K, many data,
-                    batched on the GPU, at a size where a formed matrix is hopeless.
+  Entry 1 (scale):  solve the real thing, one fixed matrix-free K, many data,
+                    batched on the GPU, at a size where a formed matrix OOMs.
 
 Run:  python examples/hello_world.py
 """

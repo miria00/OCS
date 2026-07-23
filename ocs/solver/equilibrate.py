@@ -1,5 +1,5 @@
-"""Matrix-free equilibration / preconditioning -- estimate the conditioning of K
-from operator probes ONLY, never its entries.
+"""Matrix-free equilibration / preconditioning: estimate the conditioning of K
+from operator probes only, never its entries.
 
 Two levels:
   * ``scalar_steps``       : power iteration for ||K||_2, one scalar step.

@@ -1,4 +1,4 @@
-"""Fast-transform operators.  The FFT has no sparse form — this is exactly the
+"""Fast-transform operators.  The FFT has no sparse form, hence this is the
 regime where a stored-matrix solver cannot even represent the problem, and OCS
 applies K in O(n log n) time and O(n) memory.
 

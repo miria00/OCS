@@ -33,3 +33,15 @@ examples/output/
 .idea/
 *.swp
 .DS_Store
+
+# LaTeX build intermediates (e.g. plots/plots.tex deck)
+*.aux
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.log
+*.out
+*.toc
+
+# Generated competitor / benchmark CSVs (regenerable by the run scripts)
+*.csv

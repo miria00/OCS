@@ -1,4 +1,4 @@
-"""CVXPY validation harness -- NOT part of OCS.
+"""CVXPY validation harness: just the validation part of OCS.
 
 A thin, separate bridge used ONLY to validate OCS on small LP / QP / SOCP
 instances against a mature solver (SCS).  It imports an unmodified CVXPY,

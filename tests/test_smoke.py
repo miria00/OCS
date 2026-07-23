@@ -1,4 +1,4 @@
-"""Smoke tests: operator adjoint, the FFT LASSO, and a nonnegative least squares
+"""tests: operator adjoint, the FFT LASSO, and a nonnegative least squares
 (constraint handled as a primal indicator block).  Run: python tests/test_smoke.py
 """
 import numpy as np

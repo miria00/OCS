@@ -1,0 +1,165 @@
+% OCS figure deck: one plot per page with a description.
+% Compile from inside the plots/ directory:  pdflatex plots.tex
+\documentclass[11pt]{article}
+\usepackage[margin=0.9in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage[T1]{fontenc}
+\newcommand{\reals}{\mathbf{R}}
+\graphicspath{{./}}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+
+% one figure per page:  {title}{image file}{cap height}{description body}
+\newcommand{\figpage}[4]{%
+  \begin{center}{\Large\bfseries #1}\end{center}
+  \vspace{2pt}
+  \begin{center}\includegraphics[width=\linewidth,height=#3\textheight,keepaspectratio]{#2}\end{center}
+  \vspace{4pt}
+  \small #4
+  \clearpage}
+
+\begin{document}
+
+
+
+%================================= G =========================================
+\figpage{1. Matrix-free equilibration}{G_equilibration_ablation.png}{0.40}{%
+\textbf{Problem.} Two nonnegative least-squares families:
+$\min\ \tfrac12\|Ax-b\|_2^2$ subject to $x\ge0$.\par\medskip
+\textbf{How the data was generated.} Group (a) column-scaled Gaussian: a
+base matrix $G\in\reals^{240\times180}$ is drawn once with i.i.d.\ $\mathcal
+N(0,1)$ entries then each instance multiplies its columns by
+$s_j=R^{\,u_j}$, $u_j\sim U(0,1)$ (so column norms span $[1,R]$), giving
+$A=G\,\mathrm{diag}(s)$; the right-hand side is $b=Ax_{\mathrm{true}}$ with
+$x_{\mathrm{true}}=|\mathcal N(0,1)|$ entrywise. Group (b) row-weighted
+FFT: $K=\mathrm{diag}(w)F$, where $F$ is a fixed $50\%$-subsampled length-1024
+DFT and the row weights are $w_i=R^{\,u_i}$, $u_i\sim U(0,1)$;
+$x_{\mathrm{true}}$ is $5\%$-sparse with $|\mathcal N(0,1)|$ on its support, and
+$b=Kx_{\mathrm{true}}$. Five seeds per point, and the
+conditioning parameter $R$ is swept over $\{1,3,10,30,100,300\}$.\par\medskip
+\textbf{Plot.} $x$-axis: imposed conditioning range $R$; $y$-axis: residual
+reached after a fixed 6000-iteration budget (geometric mean over 5 seeds), for
+plain scalar step sizes vs.\ the stochastic matrix-free equilibration. Scalar
+steps blow up as $R$ grows; equilibrated steps stay near tolerance}
+
+
+
+%================================= C =========================================
+\figpage{2. FFT wedge}{C_fft_wedge.png}{0.44}{%
+\textbf{Problem.} Compressed-sensing LASSO:
+$\min\tfrac12\|MFx-y\|_2^2+\lambda\|x\|_1$, $\lambda=10^{-3}$. $K=MF$ is a
+subsampled DFT ($M$ a $25\%$ random row mask, $F$ the FFT). \par\medskip
+\textbf{How the data was generated.} $K$ is built by
+\texttt{FFTMask.random(n, 0.25, seed=0)}: the length-$n$ FFT with a fixed random
+$25\%$ of the output rows kept. $y$ is a single fixed i.i.d.\
+$\mathcal N(0,1)$ vector. The plot
+measures runtime/memory scaling, not recovery accuracy. Signal length $n$ is
+swept $256\to4\times10^{6}$.\par\medskip
+\textbf{Plot.} $x$-axis $n$; $y$-axis wall time for a fixed 500-iteration budget
+(implementation scaling, not time to a common accuracy). The green marks where 
+the formed dense operator exceeds the 24\,GB GPU; cuOpt's barrier on the equivalent QP runs out of
+memory forming $K^{\top}K$ near $n\approx16{,}000$.}
+
+%================================= D =========================================
+\figpage{3. MRI / SOCP wedge}{D_mri_socp_scale.png}{0.44}{%
+\textbf{Problem.} Isotropic TV image reconstruction:
+$\min\tfrac12\|Fx-y\|_2^2+\lambda\sum_i\|(Dx)_i\|_2$, $\lambda=0.03$. $F$ is a
+$35\%$-subsampled 2-D DF%================================= A2 ========================================
+
+\textbf{How the data was generated.} $F=\texttt{FFTMask.random}(L^2,0.35,\text{%
+seed}=0)$; $D=\texttt{Gradient2D}(L,L)$. $y$ is one fixed i.i.d.\
+$\mathcal N(0,1)$ vector (seed 0). Image side $L$ is swept $16\to1024$ (up to $10^{6}$
+pixels).\par\medskip
+\textbf{Plot.} SOCP: $x$-axis number of pixels,
+$y$-axis wall time for a fixed 4000-iteration budget; the green is where
+an explicit conic canonicalization would exceed device memory.}
+
+%================================= B =========================================
+\figpage{4. Batched throughput}{B_binpack_throughput.png}{0.44}{%
+\textbf{Problem.} Bin packing:
+$I=120$ items into $B=40$ bins under $R=3$ resource constraints, $4{,}800$
+variables per instance.\par\medskip
+\textbf{How the data was generated.} The resource-usage table
+$R_{\mathrm{mat}}\in\reals^{3\times120}$ is drawn once with entries $U(0.1,1)$
+and shared by every instance (this is the fixed operator). Per instance
+(a separate stream, seed 4) the profits are $w_i\sim U(0.5,1.5)$, and each bin's
+capacity is $C_{rb}=0.6\cdot\bigl(\sum_i R_{\mathrm{mat}}[r,i]/B\bigr)\cdot
+U(0.7,1.3)$. The batch is $N$ such instances; only $w$ and $C$ vary.\par\medskip
+\textbf{Plot.} $x$-axis number of instances $N$; $y$-axis throughput
+(instances/sec). Curves are: OCS as one batched \texttt{solve\_many}, OCS
+auto-microbatched into tiles of 256, OCS solved one at a time, and cuOpt / HiGHS
+on the formed LP one at a time. Batching the whole family into a single GPU solve
+beats sequential.}
+
+%================================= E =========================================
+\figpage{5. Grouped prox dispatch}{E_grouped_prox.png}{0.44}{%
+\textbf{Plot.} Left side (a): evaluate $B$
+identical size-8 second-order-cone prox blocks, grouped \texttt{vmap} dispatch
+vs.\ a Python per-block loop, as $B$ grows (grouped stays flat; the loop is
+$\sim46\times$ slower at 512 blocks). Right side (b): hold the total block count fixed
+and grow the number of distinct block types $1\to8$.\par\medskip
+\textbf{How the data was generated.} The inputs are just
+arbitrary vectors fed to the prox. Plot (a) constructs $B$ identical size-8 SOC
+blocks; Plot (b) fixes the total block count and varies the number of distinct
+block types (1, 2, 4, 8 drawn from SOC, box, nonneg, $\ell_1$, \dots). Times
+are best of $5\times100$ reps.\par\medskip
+\textbf{Conclusion.} The prox stage is flat in the number of blocks and cheap across
+heterogeneous mixes, because each block type is one batched dispatch.}
+
+%================================= F =========================================
+\figpage{6. Kronecker storage (storage comparison, no solve)}{F_kronecker_storage.png}{0.44}{%
+\textbf{Plot.} The operator $K=A\otimes B$, applied to $\mathrm{vec}(X)$ as
+$\mathrm{vec}(AXB^{\top})$, with $A$ as $S\times S=64\times64$ and $B$ being
+$T\times T$. Plots the memory to store the dense explicit $A\otimes B$
+($(ST)^2$ floats) vs.\ storing only the two factors $A,B$ ($S^2+T^2$).%
+\par\medskip
+\textbf{How the data was generated.} The curves are exact byte
+counts as a function of $T$: the dense explicit $A\otimes B$ needs
+$(ST)^2$ floats, versus $S^2+T^2$ to store just the factors. $T$ is swept
+$4\to2048$. A pure memory comparison, not a measured run.%
+\par\medskip
+\textbf{Conclusion.} Never forming the operator is the difference between
+$O(S^2T^2)$ and $O(S^2+T^2)$ memory: the dense form crosses 24\,GB at
+$T\approx1210$, and at $T=2048$ it is $\sim4{,}000\times$ the factors'
+footprint.}
+
+%================================= A2 ========================================
+\figpage{7. Reliability Sweep}{A2_reliability_battery.png}{0.34}{%
+\textbf{Problem.} A sweep of classes: LP, QP, SOCP, quantile regression, logistic
+regression, and SDP/exp/power cone projections. Every
+class uses seed $=100\cdot(\text{size})+\{0,1,2\}$: three seeds per size, three
+sizes per class; each instance is checked against CVXPY (SCS/Clarabel).%
+\par\medskip
+\textbf{How the data was generated (per class).}
+
+\textbf{1) LP:} $\min c^{\top}x$ s.t.\ $Ax=b$, $x\ge0$; $A\in\reals^{m\times2m}$
+i.i.d.\ $\mathcal N(0,1)$, feasible point $x_{\mathrm{true}}=|\mathcal N(0,1)|$,
+$b=Ax_{\mathrm{true}}$, $c=|\mathcal N(0,1)|$; with $m=8,16,32$.\;
+\newline
+\textbf{2) QP:} $\min\tfrac12\|Ax-b\|_2^2$ s.t.\ $0\le x\le1$; $A\in\reals^{2n\times
+n}$ i.i.d.\ $\mathcal N(0,1)$, $b\sim\mathcal N(0,1)$; with $n=8,16,32$.\;
+
+\textbf{3) SOCP:} $\min c^{\top}x+\tfrac\mu2\|x\|_2^2$ s.t.\ $\|Ax\|_2\le1$,
+$\mu=10^{-2}$; $c\sim\mathcal N(0,1)$, $A\in\reals^{n\times n}$ i.i.d.\ $\mathcal
+N(0,1)$; with $n=6,12,24$.\;
+
+\textbf{4) Quantile} ($\tau=0.75$): $\min\sum\mathrm{pinball}_\tau(y-X\theta)
++\tfrac\mu2\|\theta\|_2^2$, $\mu=10^{-2}$; $X\in\reals^{20n\times n}$ i.i.d.\
+$\mathcal N(0,1)$, true $\theta\sim\mathcal N(0,1)$, $y=X\theta+0.3\,t_3$; with $n=4,8,16$.\;
+
+\textbf{5) Logistic:} $\min\sum\log(1+\exp(-b_i x_i^{\top}\theta))
++\tfrac\mu2\|\theta\|_2^2$, $\mu=0.1$; $X\in\reals^{20n\times n}$ i.i.d.\
+$\mathcal N(0,1)$, true $\theta\sim\mathcal N(0,1)$, labels
+$b_i=\mathrm{sign}(x_i^{\top}\theta+0.5\,\mathcal N(0,1))$; with $n=4,8,16$.\;
+
+\textbf{6) SDP/exp/power} (projection validation): $\min\tfrac12\|x-v\|_2^2$ s.t.\ $x$
+in the cone, $v$ a random Gaussian point (symmetrized Gaussian matrix for PSD,
+$v\sim\mathcal N(0,1)$ for exp/power); checked against the exact projection
+(eigenvalue clip for PSD) or SCS.\par\medskip
+
+\textbf{Table.} Per class: ``reached tolerance'' (OCS residual
+$<10^{-3}$) and ``agrees with reference'' (objective relative error $<10^{-2}$). 
+45 instances pass both.}
+
+\end{document}

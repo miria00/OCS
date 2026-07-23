@@ -1,4 +1,4 @@
-"""Generate the hero plot set for OCS into ../plots/ (one script, keeps the
+"""Generate the plot set for OCS into ../plots/ (one script, keeps the
 package clean).  Corrected per review: precise labels, matrix-free termination and
 equilibration both shown, honest baselines and memory markers.
 
@@ -10,7 +10,7 @@ equilibration both shown, honest baselines and memory markers.
   F  Kronecker storage         dense explicit A(x)B vs operator factors; extended past 24 GB
   G  matrix-free equilibration  SMFE (Diamond-Boyd) vs scalar on two operator families
 
-Run:  python examples/make_hero_plots.py
+Run:  python examples/make_plots.py
 """
 import os, time
 import numpy as np
@@ -185,16 +185,16 @@ def C_fft_wedge():
         if cn:
             ax.loglog(cn, cs, "s--", lw=2.2, ms=7, color=PURP, label="CVXPY/SCS, explicitly formed dense operator")
             ax.annotate(f"SCS impractical\n(>2 min at N={int(cn[-1]):,})", (cn[-1], cs[-1]), xytext=(cn[-1]*0.10, cs[-1]*0.30), color=PURP, fontsize=8.5)
-    # cuPDLP (NVIDIA cuOpt PDLP) on the LASSO-as-QP: dense K^T K materialization wall
+    # NVIDIA cuOpt barrier on the LASSO-as-QP: dense K^T K materialization wall
     ccp = os.path.join(PLOTS, "competitors_fft_cupdlp.csv")
     if os.path.exists(ccp):
         pn = []; ps = []; wall = None
         for row in _csv.DictReader(open(ccp)):
-            if row["status"] == "solved": pn.append(float(row["N"])); ps.append(float(row["cupdlp_solve_s"]))
+            if row["status"] == "solved": pn.append(float(row["N"])); ps.append(float(row["cuopt_barrier_solve_s"]))
             elif wall is None and pn: wall = pn[-1]
         if pn:
-            ax.loglog(pn, ps, "^--", lw=2.2, ms=7, color=GREEN, label="NVIDIA cuPDLP (cuOpt), dense QP")
-            ax.annotate(f"cuPDLP OOM forming\ndense QP past N~{int(pn[-1]):,}", (pn[-1], ps[-1]), xytext=(pn[-1]*0.12, ps[-1]*3.0), color="#3f6000", fontsize=8.5)
+            ax.loglog(pn, ps, "^--", lw=2.2, ms=7, color=GREEN, label="NVIDIA cuOpt barrier, explicitly formed dense QP")
+            ax.annotate(f"cuOpt OOM forming\ndense QP past N~{int(pn[-1]):,}", (pn[-1], ps[-1]), xytext=(pn[-1]*0.12, ps[-1]*3.0), color="#3f6000", fontsize=8.5)
     # precise device-memory markers
     n_op24 = np.sqrt(GPU/2)                                # 2m x N real f32 = 2 N^2 bytes > 24 GB
     n_oom = None
@@ -374,7 +374,4 @@ if __name__ == "__main__":
         try: fn()
         except Exception as e:
             import traceback; print(fn.__name__, "FAILED:", e); traceback.print_exc()
-    # remove the demoted OT performance figure from the deck
-    old = os.path.join(PLOTS, "G_ot_vs_pot.png")
-    if os.path.exists(old): os.remove(old); print("removed demoted G_ot_vs_pot.png (OT now a validation-table row)")
     print("-> plots in", PLOTS)

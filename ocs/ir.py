@@ -1,6 +1,6 @@
 """The internal representation (IR) of an OCS problem family.
 
-Everything downstream — equilibration, the PDHG engine, stopping — reads only
+Everything downstream: equilibration, the PDHG engine, stopping, reads only
 this IR, never the surface modeling syntax.  A problem family is
 
     minimize_x  g(x) + sum_i f_i(K_i x + l_i),

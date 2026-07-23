@@ -1,15 +1,15 @@
 """Type-grouped GPU dispatch for a heterogeneous list of blocks.
 
-Stephen's question: given f separable as a list of many different f_i, can we
-evaluate prox_f efficiently on a GPU?  Answer: group blocks by (type, size) and
-evaluate each group as a SINGLE vmapped kernel.  The number of kernels is the
+Given f separable as a list of many different f_i, can we
+evaluate prox_f efficiently on a GPU?  Solution: group blocks by (type, size) and
+evaluate each group as a single vmapped kernel.  The number of kernels is the
 number of distinct block types/sizes, not the number of blocks — so 10,000
 identical second-order cones cost one kernel, fully parallel.  Per-block Python
 branching (which causes warp divergence) is eliminated.
 
 Each group carries a precomputed gather index into the stacked dual vector, so
 the gather / vmap-prox / scatter is fully vectorized (no runtime Python loop over
-blocks; the loop over GROUPS is unrolled at trace time and is tiny).
+blocks; the loop over groups is unrolled at trace time and is tiny).
 """
 from __future__ import annotations
 

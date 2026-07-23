@@ -14,9 +14,15 @@ class LinearOperator:
     """Base class.  Subclasses implement ``matvec`` and ``rmatvec``.
 
     shape : (m, n)   maps R^n -> R^m
-    well_conditioned : if True, the operator's rows and columns already have
-        ~uniform norm (e.g. an orthonormal transform), so equilibration has
-        nothing to do and the (compile-time) probing is skipped.
+    well_conditioned : CERTIFIES that this operator's rows and columns
+        already have ~uniform (unit-scale) energy -- e.g. an orthonormal
+        transform.  It is a scale certificate, NOT a mere "individually well
+        conditioned" hint: stacking well_conditioned blocks is only safe when
+        each is at a COMMON unit scale, so a rescaled transform (e.g.
+        Weighted(F, 100)) must leave this False even though it is well
+        conditioned on its own.  When every stacked block certifies this, the
+        stacked operator's row/column norms are already balanced and
+        compile-time equilibration probing is skipped.
     """
     well_conditioned = False
 

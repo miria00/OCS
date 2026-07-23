@@ -1,4 +1,4 @@
-"""The proximal-block interface — the heart of OCS's prox library.
+"""The proximal-block interface: OCS's prox library.
 
 A block is accessed only through its scaled proximal operator
 

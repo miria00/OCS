@@ -1,4 +1,4 @@
-"""Fast structured transforms as matrix-free operators (Boyd's wishlist):
+"""Fast structured transforms as matrix-free operators:
 DCT, orthonormal Haar wavelet, fast Gauss transform (Gaussian blur), and a
 Laplacian (Poisson) solve.  Each is applied through matvec/rmatvec only; the
 dense transform is never formed.  FFTs use complex64 (float32 substrate).

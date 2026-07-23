@@ -1,23 +1,27 @@
 """Stochastic matrix-free equilibration (Diamond & Boyd, JOTA 2017).
 
-Instead of a one-shot estimate of per-coordinate steps, SOLVE the equilibration
+Instead of a one-shot estimate of per-coordinate steps, solve the equilibration
 problem itself by projected stochastic gradient over row/column log-scalings.
 Minimize (their problem 5)
 
-    f(u,v) = 1/2 sum_ij A_ij^2 e^{2u_i+2v_j} - a2 1^T u - b2 1^T v + (g/2)||(u,v)||^2
-    s.t.  ||u||_inf <= M, ||v||_inf <= M,
+    f(u,v) = 1/2 sum_ij A_ij^2 e^{2u_i+2v_j} - r 1^T u - s 1^T v + (g/2)||(u,v)||^2
+    s.t.  ||u||_inf <= M, ||v||_inf <= M,  u_{B_i} constant (scalar-metric blocks),
 
-using ONLY matvec/rmatvec.  The gradient in u is the row-norms^2 of DAE (D=diag e^u,
-E=diag e^v) minus a2 plus g*u; its unbiased estimate is |D A E s|^2 for a random
-sign vector s (one matvec).  Iterate-averaged projected SGD converges O(1/t).
+using only matvec/rmatvec.  Use squared-norm targets r = sqrt(n/m)
+(rows) and s = sqrt(m/n) (columns), which satisfy m r = n s; the necessary
+condition for the row and column targets to be jointly attainable on a rectangular
+operator (unit targets r = s = 1 are infeasible unless m = n).  The gradient in u
+is the row-norms^2 of DAE (D=diag e^u, E=diag e^v) minus r plus g*u; its unbiased
+estimate is |D A E s|^2 for a random sign vector s (one matvec).  Iterate-averaged
+projected SGD converges O(1/t).
 
 The equilibrated scalings give the PDHG diagonal steps tau = e^{2 vbar} (primal,
 per column) and sigma = e^{2 ubar} (dual, per row); a final power iteration on the
 scaled operator applies the global rescale for the PDHG stability bound.
 
 Rows of a coupled (scalar-class) block are averaged in log space each step, so the
-dual scaling stays uniform over that block -- the block-admissible coercion done
-INSIDE the optimization, not fighting it afterwards.
+dual scaling stays uniform over that block; the block-admissible coercion done
+inside the optimization, not fighting it afterwards.
 """
 from __future__ import annotations
 
@@ -34,6 +38,8 @@ def smfe_equilibration(matvec, rmatvec, n, m, scalar_spans=(), *,
     they do NOT reduce variance here -- multi-probe averaging is the right lever.
     """
     spans = tuple((int(a), int(b)) for a, b in scalar_spans)
+    r_tgt = jnp.sqrt(jnp.float32(n) / jnp.float32(m))   # row squared-norm target
+    s_tgt = jnp.sqrt(jnp.float32(m) / jnp.float32(n))   # col squared-norm target (m r = n s)
 
     def rade(k, d):
         return jnp.where(jax.random.bernoulli(k, 0.5, (d,)), 1.0, -1.0).astype(jnp.float32)
@@ -47,8 +53,8 @@ def smfe_equilibration(matvec, rmatvec, n, m, scalar_spans=(), *,
             row_e = row_e + (eu * matvec(ev * rade(k1, n))) ** 2  # est. row-norms^2(DAE)
             col_e = col_e + (ev * rmatvec(eu * rade(k2, m))) ** 2 # est. col-norms^2(DAE)
         tf = t.astype(jnp.float32)
-        gu = row_e / probes - 1.0 + gamma * u
-        gv = col_e / probes - 1.0 + gamma * v
+        gu = row_e / probes - r_tgt + gamma * u
+        gv = col_e / probes - s_tgt + gamma * v
         eta = 2.0 / (gamma * (tf + 2.0))
         u = jnp.clip(u - eta * gu, -M, M)
         v = jnp.clip(v - eta * gv, -M, M)

@@ -1,5 +1,5 @@
 """Structured operators for the matrix-variable / fast-transform problems that are
-the whole point of OCS -- accessed only through matvec/rmatvec, never formed.
+  accessed only through matvec/rmatvec, never formed.
 
   MarginalOperator : X (N x M) |-> (row sums, col sums)   [optimal transport]
   Gradient2D       : image (H x W) |-> per-pixel (d_x, d_y) forward differences

@@ -3,7 +3,7 @@
   * cuPDLP        = cuOpt method=PDLP        (the GPU first-order LP/QP solver)
   * cuOpt(simplex)= cuOpt method=DualSimplex (the classical exact method)
 
-Both are STORED-MATRIX solvers: they need the constraint / quadratic matrix in
+Both are matrix solvers: they need the constraint / quadratic matrix in
 memory, so on the operator problems (FFT) they hit a materialization wall.  A hard
 memory guard prevents ever pushing the host/GPU to a crash.
 
@@ -54,10 +54,13 @@ with open(os.path.join(PLOTS, "competitors_binpack.csv"), "w", newline="") as f:
         med = float(np.median(tp[name])); w.writerow([name, med, 1.0 / med])
         print(f"binpack {name:16s}: {med*1e3:6.1f} ms  ({1/med:5.1f} inst/s)")
 
-# ============ (C) FFT LASSO as a QP: cuPDLP hits the K^T K materialization wall ============
+# ============ (C) FFT LASSO as a QP: cuOpt BARRIER hits the K^T K materialization wall ==
 # min 1/2||Kx-y||^2 + lam||x||_1 (K = subsampled DFT, dense).  Posed for a stored-matrix
 # QP solver: split x = u - v >= 0, quadratic P = [[G,-G],[-G,G]] with G = K^T K (DENSE
 # N x N -- the FFT operator has no sparse form).  We STOP before P exceeds the guard.
+# cuOpt QPs go through the BARRIER method (PDLP is an LP-only method); we set an
+# explicit 1e-4 optimality tolerance so the timing is a like-for-like comparison.
+FFT_TOL = 1e-4
 def fft_operator(N, ratio=0.25, seed=0):
     r = np.random.default_rng(seed)
     m = max(1, int(ratio * N)); rows = r.choice(N, m, replace=False)
@@ -84,12 +87,12 @@ for N in [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]:
         dm.set_objective_coefficients(q)
         Psp = sp.csr_matrix(Pmat)
         dm.set_quadratic_objective_matrix(Psp.data, Psp.indices.astype(np.int32), Psp.indptr.astype(np.int32))
-        ss = lp.SolverSettings(); ss.set_optimality_tolerance(1e-3); ss.set_parameter("method", int(lp.SolverMethod.PDLP))
+        ss = lp.SolverSettings(); ss.set_optimality_tolerance(FFT_TOL); ss.set_parameter("method", int(lp.SolverMethod.Barrier))
         t = time.perf_counter(); sol = lp.Solve(dm, ss); dt = time.perf_counter() - t
-        rows.append([N, dt, "solved"]); print(f"FFT N={N}: cuPDLP QP {dt:.2f}s (dense P {P_gb:.2f} GB)")
+        rows.append([N, dt, "solved"]); print(f"FFT N={N}: cuOpt barrier QP {dt:.2f}s (dense P {P_gb:.2f} GB, tol {FFT_TOL:g})")
     except Exception as e:
         rows.append([N, None, f"OOM/{type(e).__name__}"]); print(f"FFT N={N}: {type(e).__name__} {str(e)[:50]}")
 with open(os.path.join(PLOTS, "competitors_fft_cupdlp.csv"), "w", newline="") as f:
-    w = csv.writer(f); w.writerow(["N", "cupdlp_solve_s", "status"]); w.writerows(rows)
+    w = csv.writer(f); w.writerow(["N", "cuopt_barrier_solve_s", "status"]); w.writerows(rows)
 print("wrote competitors_binpack.csv + competitors_fft_cupdlp.csv")
 print("note: MRI-SOCP is a second-order-cone program -- cuOpt/cuPDLP are LP/QP only and cannot represent it.")

@@ -1,4 +1,4 @@
-"""Matrix-free termination: a primal AND a dual fixed-point residual, each from a
+"""Matrix-free termination: a primal and a dual fixed-point residual, each from a
 constant number of oracle calls.
 
 For min_x c^T x + g(x) + sum_i f_i(K_i x + l_i), a point (x, y) is optimal iff it
