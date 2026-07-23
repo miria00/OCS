@@ -6,7 +6,7 @@ OCS is an operator-native convex solver for large-scale problems on GPUs. It
 solves `minimize sum_i f_i(K_i x + l_i)` where `f` is block separable and each
 linear operator `K_i` is accessed **only** through its forward and adjoint
 products (never formed, factored, or indexed), and each `f_i` through a
-GPU-native proximal block. You compile a problem *family* once and then solve
+GPU-native proximal block. You compile a problem family once and then solve
 many instances with changing data in a single batched GPU call.
 
 ## Installation
