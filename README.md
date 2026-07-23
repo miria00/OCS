@@ -64,9 +64,9 @@ OCS has exactly two ways in:
    matrix-free, compile once, and solve it, including the "one fixed `K`, many
    data" regime, on the GPU, at sizes where a formed-matrix solver runs out of
    memory.
-2. **Sanity-check against CVXPY** (small problems): a thin, separate harness that
+2. **Sanity-check against CVXPY** (small problems): a separate harness that
    solves the same small problem with OCS and with SCS/Clarabel and compares. Use
-   it to gain trust before scaling up. It is *not* part of the core solver.
+   it to validate before scaling up. It is not part of the core solver.
 
 ### Entry point 1: solve at scale
 
@@ -79,8 +79,8 @@ $$
 $$
 
 where $K = M F$ (mask times orthonormal FFT) is never formed. Compile the family
-once, then solve one instance, or a whole **batch of instances with the same `K`
-and different data `y`**, in a single GPU call.
+once, then solve one instance, or a whole batch of instances with the same `K`
+and different data `y`, in a single GPU call.
 
 ```python
 import numpy as np
@@ -126,8 +126,8 @@ reports how often OCS reaches tolerance and agrees with CVXPY (SCS / Clarabel).
 ## Experiments
 
 The `examples/` directory holds the killer problems: optimal transport at scale
-(`killer_ot_scale.py`, **10⁴×10⁴ = 10⁸ variables**), MRI-SOCP, feature selection,
-bin-packing, 3-D imaging, Sylvester (with the CG path), Kronecker, multicommodity
+(`killer_ot_scale.py`, **10^4 x 10^4 = 10^8 variables**), MRI-SOCP, feature selection,
+bin-packing, 3D imaging, Sylvester (with the CG path), Kronecker, multicommodity
 flow with piecewise-linear congestion costs, and sparse deconvolution via the fast
 Gauss transform, plus the figure scripts. To regenerate the figure deck and run
 the checks:
@@ -139,7 +139,7 @@ python examples/matrix_metric_demo.py      # the matrix scaling tier (39 vs 588 
 python examples/run_competitors.py         # optional: cuOpt / HiGHS / SCS overlays
 ```
 
-The **reliability battery** sweeps LP / QP / SOCP / SDP / exp / power / quantile /
+The reliability battery sweeps LP / QP / SOCP / SDP / exp / power / quantile /
 logistic across sizes and seeds and reports, per class, how often OCS reaches its
 matrix-free tolerance and how often it agrees with CVXPY (SCS / Clarabel). Figures
 land in [`plots/`](plots/); [`plots/README.md`](plots/README.md) captions each one.
@@ -147,10 +147,9 @@ land in [`plots/`](plots/); [`plots/README.md`](plots/README.md) captions each o
 ## Design notes
 
 - **One solver.** The problem always runs on the operator-pure restart-PDHG
-  engine in `ocs/solver/composite_pdhg.py`. The one exception is the *pure*
+  engine in `ocs/solver/composite_pdhg.py`. The one exception is the pure
   least-squares regime (a lone quadratic through an operator, e.g. the Sylvester
-  problem), where `compile(method="cg")` uses matrix-free CGLS, the right tool
-  there, reaching the same accuracy in ~1500× fewer iterations.
+  problem), where `compile(method="cg")` uses matrix-free CGLS, reaching the same accuracy in ~1500× fewer iterations.
 - **Three scaling tiers, all live.** scalar / diagonal / matrix, chosen per block
   by structure (`docs/scaling_contract.md`). The matrix tier (`prox_matrix`, a
   dense `(Q+D)⁻¹` solve for quadratic blocks) preconditions ill-conditioned QPs.
@@ -185,6 +184,6 @@ ocs/
                    groups (type-grouped GPU dispatch)
   model/           surface API (Variable, Parameter, terms) + compile()
   solver/          restart-PDHG engine, matrix-free equilibration + termination
-  cvxpy_harness/   thin validation-only bridge (NOT part of OCS)
+  cvxpy_harness/   thin validation-only bridge 
 docs/ · examples/ · plots/ · tests/
 ```
