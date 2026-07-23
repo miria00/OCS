@@ -26,12 +26,15 @@ classifiers = [
 Repository = "https://github.com/cvxgrp/ocs"
 
 [project.optional-dependencies]
-validation = ["cvxpy>=1.4", "scs", "clarabel"]
+validation = ["cvxpy>=1.4", "scs", "clarabel", "scipy>=1.10"]
 dev = [
-    "matplotlib>=3.9",
+    "matplotlib>=3.8",
     "pytest>=8.0",
     "cvxpy>=1.4",
     "scs",
+    "clarabel",
+    "scipy>=1.10",
+    "POT>=0.9",
 ]
 
 [build-system]

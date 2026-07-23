@@ -11,14 +11,42 @@ many instances with changing data in a single batched GPU call.
 
 ## Installation
 
+OCS is a GPU solver, so the recommended path installs JAX with CUDA. Known-good
+versions are pinned in [`requirements.txt`](requirements.txt) (tested on Python
+3.10).
+
+### From source (to try it now)
+
 ```bash
-pip install ocs
+git clone https://github.com/miria00/OCS.git
+cd OCS
+python -m venv .venv && source .venv/bin/activate
+
+# GPU run (recommended): install JAX with CUDA 12 first, then everything else
+pip install "jax[cuda12]==0.4.30"
+pip install -r requirements.txt
+
+# then install OCS itself (editable)
+pip install -e .
 ```
 
-To also run the CVXPY validation harness and the figure scripts:
+For a **CPU-only trial** (small problems, slower), skip the `jax[cuda12]` line and
+just run `pip install -r requirements.txt` (the plain `jax` pin is CPU). The
+competitor-overlay figures also need NVIDIA cuOpt, which is GPU only and not on
+PyPI; see the note at the bottom of `requirements.txt`.
+
+### From PyPI (once released)
 
 ```bash
-pip install "ocs[validation,dev]"
+pip install ocs                       # core solver
+pip install "ocs[validation,dev]"     # plus the CVXPY harness and figure scripts
+```
+
+Check the install:
+
+```bash
+python examples/hello_world.py        # a compressed-sensing LASSO solve
+pytest -q                             # the test suite
 ```
 
 ## Background

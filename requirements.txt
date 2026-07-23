@@ -1,0 +1,28 @@
+# OCS reproducible environment. Known-good on Python 3.10.
+#
+# OCS is a GPU solver. For a real (GPU) run, install JAX with CUDA FIRST, then
+# this file:
+#     pip install "jax[cuda12]==0.4.30"
+#     pip install -r requirements.txt
+#
+# For a CPU-only trial (small problems, slower), the plain jax pinned below is
+# enough; just run:
+#     pip install -r requirements.txt
+
+# core solver
+jax==0.4.30
+numpy==1.26.2
+
+# validation harness (compare OCS against reference solvers)
+scipy==1.15.3
+cvxpy==1.4.2
+scs==3.2.4
+clarabel==0.6.0
+
+# figures and examples
+matplotlib==3.8.2
+POT==0.9.6.post1
+
+# Optional: the competitor-overlay figures use NVIDIA cuOpt, which is not on
+# PyPI and is GPU only. Install it separately if you want those comparisons:
+#     pip install --extra-index-url https://pypi.nvidia.com cuopt-cu12
