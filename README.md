@@ -2,216 +2,263 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-OCS is an operator-native convex solver for large-scale problems on GPUs. It
-solves `minimize sum_i f_i(K_i x + l_i)` where `f` is block separable and each
-linear operator `K_i` is accessed **only** through its forward and adjoint
-products (never formed, factored, or indexed), and each `f_i` through a
-GPU-native proximal block. You compile a problem family once and then solve
-many instances with changing data in a single batched GPU call.
+OCS is an operator-native convex solver. It solves
+
+    minimize  sum_i f_i(K_i x + l_i)
+
+where each `K_i` is reached only through its forward and adjoint products and
+each `f_i` is a proximal block evaluated on the GPU. The constraint matrix is
+never formed. A problem family is compiled once and then solved for many
+instances with changing data, one at a time or as a batch.
+
+This is version **0.3.7**. It validates recovered bounds on the actual returned
+witness, integrates bounded opt-in refinement, and reduces large-array storage
+and compilation overhead. It retains the objective-gap stall fix, stable opt-in
+SOC/PSD metric construction, and prepared quadratic transport solver.
+Before publication, install the qualified wheel file directly; the index
+commands below apply once that version is published.
 
 ## Installation
 
-OCS is a GPU solver, so the recommended path installs JAX with CUDA. Known-good
-versions are pinned in [`requirements.txt`](requirements.txt) (tested on Python
-3.10).
+For repeated dense quadratic OT on an NVIDIA GPU, see
+[prepared quadratic transport](docs/quadratic_transport.md). Its optional
+`transport` extra and `ocs.transport.PreparedQuadraticOT` API use a specialized
+first-order implementation and an explicit numerical objective-bracket test.
+This path keeps the general solver defaults unchanged. Warm comparison results
+exclude preparation and do not establish a capacity or full-metric advantage.
 
-### From source (to try it now)
+This successor targets Linux and Python 3.12 with `jax==0.11.1` and
+`numpy>=1.24`. The large-array lowering implementation uses JAX's compiler
+internals, so this package pins the JAX version it qualifies. Older environment
+pins in `requirements.txt` are historical records, not this installation route.
+The GPU procedure that this release was qualified on is Python 3.12 with
+JAX 0.11.1 and CUDA 12 on an NVIDIA RTX 5090, with the compiler settings below.
+These settings avoid the GPU compiler failures encountered during qualification;
+they change compilation scheduling, not OCS's accuracy criterion.
 
-```bash
-git clone https://github.com/miria00/OCS.git
-cd OCS
-python -m venv .venv && source .venv/bin/activate
-
-# GPU run (recommended): install JAX with CUDA 12 first, then everything else
-pip install "jax[cuda12]==0.4.30"
-pip install -r requirements.txt
-
-# then install OCS itself (editable)
-pip install -e .
-```
-
-For a **CPU-only trial** (small problems, slower), skip the `jax[cuda12]` line and
-just run `pip install -r requirements.txt` (the plain `jax` pin is CPU). The
-competitor-overlay figures also need NVIDIA cuOpt, which is GPU only and not on
-PyPI; see the note at the bottom of `requirements.txt`.
-
-### From PyPI (once released)
+GPU, the qualified procedure:
 
 ```bash
-pip install ocs                       # core solver
-pip install "ocs[validation,dev]"     # plus the CVXPY harness and figure scripts
+python3.12 -m venv ocs-env
+source ocs-env/bin/activate
+python -m pip install "jax[cuda12]==0.11.1"
+python -m pip install "ocsolver==0.3.7"
+export XLA_FLAGS="--xla_gpu_enable_triton_gemm=false --xla_gpu_force_compilation_parallelism=1"
+python -c "import jax; print(jax.devices())"     # expect a CudaDevice
 ```
 
-Check the install:
+Pin the version to reproduce the qualified installation. CPU only, for small problems:
 
 ```bash
-python examples/hello_world.py        # a compressed-sensing LASSO solve
-pytest -q                             # the test suite
+python -m pip install "jax==0.11.1" "ocsolver==0.3.7"
 ```
 
-## Background
+Confirm the installed identity before reporting a result:
 
-OCS targets the problem
+```bash
+python -c "import ocs, importlib.metadata as m; print(ocs.__version__, m.version('ocsolver'))"
+```
 
-$$
-\begin{array}{ll}
-\text{minimize} & \sum_{i=1}^N f_i(K_i x + l_i),
-\end{array}
-$$
+Both must print `0.3.7`.
 
-with variable $x \in \mathbf{R}^n$, block-separable closed convex $f_i$, offsets
-$l_i \in \mathbf{R}^{m_i}$, and linear operators $K_i : \mathbf{R}^n \to \mathbf{R}^{m_i}$.
-This form covers linear, quadratic, and second-order-cone programs, as well as
-imaging, total-variation, optimal-transport, and matrix-variable problems. A
-linear cost or a simple separable term is itself a block (with $K_i = I$).
+## First solve
 
-What makes OCS operator-native is the contract on $K_i$: it is supplied only as
-a pair of functions,
-
-$$
-v \mapsto K_i v \quad (\text{matvec}), \qquad w \mapsto K_i^T w \quad (\text{rmatvec}),
-$$
-
-so a subsampled FFT, a DCT, a Haar wavelet, a Gaussian blur, a Laplacian solve, a
-gradient, a marginal (optimal transport), or a Kronecker product $A \otimes B$ is
-applied directly to its structured argument and the $m_i \times n$ matrix is never
-materialized. Everything downstream respects this: equilibration, the PDHG
-iteration, and termination all run from a constant number of `matvec`/`rmatvec`
-and prox calls. Each $f_i$ is a proximal block that declares how finely it can be
-metric-scaled (scalar / diagonal / matrix); see
-[`docs/scaling_contract.md`](docs/scaling_contract.md).
-
-The whole solve runs on one adaptive-restart PDHG engine in float32, to a 1e-3
-relative residual, and is `jax.vmap`-batched over instances.
-
-## Usage: two entry points
-
-OCS has exactly two ways in:
-
-1. **Solve at scale** (the real solver). Define a family `min f(Kx+l)` with `K`
-   matrix-free, compile once, and solve it, including the "one fixed `K`, many
-   data" regime, on the GPU, at sizes where a formed-matrix solver runs out of
-   memory.
-2. **Sanity-check against CVXPY** (small problems): a separate harness that
-   solves the same small problem with OCS and with SCS/Clarabel and compares. Use
-   it to validate before scaling up. It is not part of the core solver.
-
-### Entry point 1: solve at scale
-
-Compressed-sensing LASSO with a subsampled-FFT operator,
-
-$$
-\begin{array}{ll}
-\text{minimize} & \lambda \lVert x \rVert_1 + \tfrac{1}{2}\lVert M F x - y \rVert_2^2,
-\end{array}
-$$
-
-where $K = M F$ (mask times orthonormal FFT) is never formed. Compile the family
-once, then solve one instance, or a whole batch of instances with the same `K`
-and different data `y`, in a single GPU call.
+Nonnegative least squares with the operator supplied as a function. The
+solution is approximately `[0, 1, 1]`. The same code is in
+`examples/hello_world.py`.
 
 ```python
-import numpy as np
 import jax.numpy as jnp
 import ocs
 
-n = 4096
-K = ocs.FFTMask.random(n, ratio=0.25, seed=0)   # K: R^n -> R^{2m}, matrix-free
-x = ocs.Variable(n)
-y = ocs.Parameter("y")                           # per-instance data (varies per instance)
-
-problem  = ocs.minimize([
-    ocs.l1(x, lam=1e-3),                         # an l1 block (K = I)
-    ocs.least_squares(K @ x - y),                # f(Kx + l),  l = -y
-])
-compiled = problem.compile()                     # compile the family + scaling ONCE
-
-# one instance
-sol = compiled.solve_instance({"y": y_meas})
-
-# MANY instances, same K, different y: one batched GPU solve (the parametric regime)
-xb, yb, iters, res = compiled.solve_many({"y": Y_batch})
-
-# matrix-free certificate for a solution: primal / dual residual + surrogate gap
-cert = compiled.certificate(sol.x, sol.y, {"y": y_meas})
+weights = jnp.array([1.0, 2.0, 3.0])
+K = ocs.LinearOperator.from_forward(lambda v: weights * v, n=3, m=3)
+x = ocs.Variable(3)
+b = ocs.Parameter("b")
+family = ocs.minimize([ocs.nonneg(x), ocs.least_squares(K @ x - b)])
+compiled = family.compile(tol=1e-3)
+sol = compiled.solve_instance({"b": jnp.array([-1.0, 2.0, 3.0])})
+print(sol.status, sol.accuracy_criterion, sol.objective_gap, sol.x)
 ```
 
-Run it with `python examples/hello_world.py`. This is the regime where a
-formed-matrix GPU solver would need the explicit `M F` (impossible at scale); see
-the wedge figures in [`plots/`](plots/).
+`from_forward` builds the adjoint of a JAX-linear function; a
+`LinearOperator` subclass can supply `matvec` and `rmatvec` directly. The
+library operators include subsampled FFT, 2-D and 3-D gradients, marginal
+maps, Kronecker and Sylvester products, and multicommodity-flow incidence.
 
-### Entry point 2: sanity-check against CVXPY
+## Accuracy: what a status means
+
+`sol.status` is one of `solved`, `inaccurate`, `unverified`,
+`primal_infeasible`, `unbounded` and `numerical_error`.
+`sol.accuracy_criterion` names the test that awarded it. Under the default,
+`objective_gap`, the policy is `returned-point-three-condition-scaleinv-v2`:
+
+- **`solved`** means that at the returned point `x`, with an exactly
+  dual-feasible witness `y`, the cost `J(x)` is finite, the relative primal
+  infeasibility is at most `tol`, and `|J(x) - D(y)| <= tol * max(|J(x)|, |D(y)|)`.
+  This is an approximate-KKT acceptance of the kind SCS and OSQP use, and it
+  is invariant to rescaling the problem data. It is **not** a bound on the
+  optimal value: the cost at an approximately feasible point bounds nothing.
+- **`inaccurate`** means the test was evaluated and failed, or the iteration
+  budget ran out first; `sol.accuracy_detail` says which.
+- **`unverified`** means nothing could be decided: no block contract exists
+  for this family, no witness was found, or the computed gap and `tol` differ
+  by less than float32 can resolve at this objective scale. An `unverified`
+  result is never reported as optimal.
+
+The witness `y` is a candidate built from the current dual iterate: the
+iterate itself, a violation-corrected dual, the dual scaled along its own ray,
+or a blend toward a feasible anchor. A candidate counts only when it passes the
+exact conjugate-domain and coupling tests, and the stronger valid bound is kept
+from check to check. Sensitive tests use scoped float64 with a rounding
+envelope: PSD cone membership, coupling of an l1 primal over subsampled Fourier
+operators, and the marginal LP's represented price/cost slack. A witness whose
+sign is unresolved is refused. When none of these meets the criterion at a check, the
+single-instance controller (`solve_instance`) also tries the dual-bound routes
+that fit the family's structure: the recession shift, the packing-LP assignment
+dual and the compound ridge. They are selected by
+`compile(dual_routes=("shift", "packing", "ridge"))`, the default, and turned
+off with `dual_routes=()`. Their candidates pass the same tests, their time and
+operator applications are recorded in `sol.gap_history`, and
+`sol.objective_bound_source` names the candidate that certified.
+
+`sol.objective_gap`, `sol.objective_lower_bound`, `sol.objective_primal_value`
+and `sol.relative_primal_infeasibility` carry the quantities tested.
+`compiled.acceptance(report)` applies the same decision to any bound report
+and also answers the stricter **bracket** question, `target_met_bracket`,
+which carries weak duality and is claimed only when the upper bound is
+justified by an exactly feasible point. `sol.residual` is this algorithm's
+relative prox-graph residual; it is reported and decides nothing. Pass
+`accuracy="residual"` to `solve_instance` to accept on it instead, as
+releases before 0.2.0 did.
+
+`sol.termination` distinguishes meeting the criterion from an iteration limit,
+numerical failure, or `"stalled"`. The objective-gap controller can stop after
+three check intervals without one-percent relative improvement in the gap,
+residual or primal feasibility. A stall does not award success, relax `tol`,
+or prove that further progress is impossible. Scalar and batch result interfaces
+preserve the pair and report at each lane's own stopping check. The batch driver
+can still evaluate terminal lanes while other lanes continue; those evaluations
+do not replace the stored result. The raw `solve_many` interface retains its
+existing residual-based behavior.
+
+## Equilibration
+
+The default, `equilibrate="sgd"`, is the stochastic matrix-free equilibration
+of Diamond and Boyd, from forward and adjoint products only. It uses diagonal
+metrics where the proximal block supports them and scalar metrics on blocks
+whose default proximal interface accepts only a scalar. This is what every
+example above uses.
+
+A richer metric is declared, never selected automatically, through one call:
 
 ```python
-from ocs.cvxpy_harness import validate_against_cvxpy
-report = validate_against_cvxpy(cvxpy_problem)   # small LP / QP / SOCP
-print(report["rel_err"])                         # OCS vs SCS objective agreement
+compiled = family.compile(
+    tol=1e-5,
+    equilibrate="construct",
+    metric_classes={0: "full"},        # {dual_term_index: class}
+)
+print(compiled.meta["metric_construction"])   # what was built, from how many products
 ```
 
-For a whole sweep of classes and sizes, `python examples/reliability_battery.py`
-reports how often OCS reaches tolerance and agrees with CVXPY (SCS / Clarabel).
+The classes are `"scalar"`, `"diagonal"`, `"full"`, `"spatial_full"` and `"automorphism"`;
+`(class, "per_block")` or `(class, "term")` says which mathematical blocks
+share one metric. Dual terms are indexed in the order they appear, skipping
+the primal term. Every construction uses products only and records its
+product count. Supported structures in this release:
 
-## Experiments
+| class | supported on | notes |
+|---|---|---|
+| `scalar` | every supported proximal block | one scalar per mathematical block, or shared across a term |
+| `diagonal` | blocks with a coordinatewise metric prox; supported quadratic, `L2` and `GroupL2` structures | availability and sharing follow the block's metric contract; not arbitrary weights on every cone |
+| `full` | separable quadratic blocks, `L2` and `GroupL2` blocks | one rotated `k x k` shape, shared across the identical blocks of a term |
+| `spatial_full` | one `SecondOrderCone` term | `diag(a, Q diag(b) Q^T)`, block size at most 1024 |
+| `automorphism` | `SecondOrderCone`, `SOCBatch`, `PSDCone` | cone-preserving full metric, per block or shared by a term |
 
-The `examples/` directory holds the killer problems: optimal transport at scale
-(`killer_ot_scale.py`, **10^4 x 10^4 = 10^8 variables**), MRI-SOCP, feature selection,
-bin-packing, 3D imaging, Sylvester (with the CG path), Kronecker, multicommodity
-flow with piecewise-linear congestion costs, and sparse deconvolution via the fast
-Gauss transform, plus the figure scripts. To regenerate the figure deck and run
-the checks:
+In particular, the constructor **rejects `diagonal` for `SecondOrderCone`,
+`SOCBatch` and `PSDCone`**. Use `scalar`, or request `automorphism` for a
+cone-preserving full metric. For a PSD block, a diagonal congruence
+`Z -> D Z D` belongs to the automorphism class; it is not an arbitrary diagonal
+weighting of the flattened matrix entries. Other coupled blocks whose proximal
+interface supports only scalar metrics also reject unsupported diagonal
+declarations. These are implementation support limits, not claims that other
+weighted projections are mathematically impossible.
 
-```bash
-python examples/make_plots.py              # writes plots/*.png
-python examples/reliability_battery.py     # solve-rate table across classes -> plots/A2_*.png
-python examples/matrix_metric_demo.py      # the matrix scaling tier (39 vs 588 iters)
-python examples/run_competitors.py         # optional: cuOpt / HiGHS / SCS overlays
+Anything else is refused by name with a `ValueError` that says why:
+`spatial_full` on a batched cone, a PSD cone or a non-cone block;
+`automorphism` on exponential, power or nonsymmetric cones; a block size above
+the constructor's limit.
+Whether a richer class pays is measured, not assumed: on the families it was
+qualified on it wins at strong within-block coupling with a reused operator,
+and on second-order cones of block size 128 and above, and it loses or ties
+elsewhere. `equilibrate="scalar"` and `"exact"` remain available; `"exact"`
+needs squared-operator oracles and is outside the two-product interface.
+
+In 0.3.2, `equilibrate="construct", metric_classes={i: "automorphism"}`
+opts term `i` into stable automatic symmetric-cone construction. SOC updates
+use scaled exponentials and a log-determinant identity, clipping spectral logs
+before exponentiating. PSD updates bound each carrier's step by
+`eta_eff = min(eta, 0.5 / ||Y||_F)`. This changes the old PSD step schedule;
+the construction report records the effective steps. Invalid arithmetic fails
+explicitly, and the existing metric-domain and measured-norm safeguards remain.
+Scalar/diagonal defaults are unchanged. A full metric is not automatically
+faster: qualification of the arithmetic is separate from a performance benefit.
+
+## Batching
+
+The specialized quadratic OT solver also supports prepared GPU batches through
+`PreparedQuadraticOT(..., batch_size=B).solve_many_results(data)`, returning one
+`QuadraticOTResult` per problem. It vectorizes the fused OT update and checks
+each actual returned pair. Its lockstep policy and finite output ownership are
+documented in [quadratic transport](docs/quadratic_transport.md#batches).
+
+`compiled.solve_many_results(data)` solves a batch in one GPU call and returns
+one `Solution` per row, each held to the **same** acceptance test as
+`solve_instance`, through the same code, so no row is accepted on a test the
+single solve would refuse:
+
+```python
+rows = compiled.solve_many_results({"b": jnp.array([[-1.0, 2.0, 3.0], [2.0, -2.0, 6.0]])})
+for r in rows:
+    print(r.status, r.objective_gap, r.iters)
 ```
 
-The reliability battery sweeps LP / QP / SOCP / SDP / exp / power / quantile /
-logistic across sizes and seeds and reports, per class, how often OCS reaches its
-matrix-free tolerance and how often it agrees with CVXPY (SCS / Clarabel). Figures
-land in [`plots/`](plots/); [`plots/README.md`](plots/README.md) captions each one.
+`compiled.solve_many(data)` is the **legacy** raw interface: it returns device
+arrays `(x, y, blocks, residuals)` from the residual-driven loop and does not
+apply the default accuracy contract. Use it only when you score the points
+yourself.
 
-## Design notes
+## Limits
 
-- **One solver.** The problem always runs on the operator-pure restart-PDHG
-  engine in `ocs/solver/composite_pdhg.py`. The one exception is the pure
-  least-squares regime (a lone quadratic through an operator, e.g. the Sylvester
-  problem), where `compile(method="cg")` uses matrix-free CGLS, reaching the same accuracy in ~1500× fewer iterations.
-- **Three scaling tiers, all live.** scalar / diagonal / matrix, chosen per block
-  by structure (`docs/scaling_contract.md`). The matrix tier (`prox_matrix`, a
-  dense `(Q+D)⁻¹` solve for quadratic blocks) preconditions ill-conditioned QPs.
-- **Matrix-free termination.** Primal and dual fixed-point residuals, plus a
-  surrogate duality gap, all from a constant number of oracle calls; for smooth
-  blocks the exact gradient is substituted into the primal residual for tight
-  termination. Validated against SCS.
-- **Matrix-free equilibration.** The default (`equilibrate="sgd"`) adapts Diamond
-  & Boyd's stochastic matrix-free equilibration (JOTA 2017) to the operator-native
-  PDHG setting: projected SGD over row/column log-scalings from `matvec`/`rmatvec`
-  only. Robust orders-of-magnitude win on ill-conditioned operators, harmless on
-  well-conditioned ones.
-- **The prox library** is organized as a system: a POGS-style calculus, a declared
-  scaling tier per block, the LP/QP/SOCP cone set plus PSD / exp / power (public
-  term builders `soc`/`psd`/`exp_cone`/`pow_cone`), the regression losses
-  (`pinball`/`quantile`, `logistic`), piecewise-linear convex costs (`pwl`, for
-  concave-utility / congestion problems), and type-grouped GPU dispatch: one
-  batched `vmap` dispatch per block type, flat in the number of blocks. See
-  [`docs/prox_inventory.md`](docs/prox_inventory.md).
-- **Float32.** Required for fast GPU cuFFT on transform operators; the 1e-3
-  relative tolerance sits far above f32 epsilon.
-- **CVXPY is validation only**, a separate harness, not part of the core.
+- The method assumes a saddle point. Infeasibility and unboundedness are
+  detected only for the supported block domains; an absent certificate is not
+  proof of feasibility.
+- Arithmetic is float32. A tolerance finer than float32 can resolve at the
+  problem's objective scale is refused as `unverified`, not granted.
+- Exponential and power cones have bounded validation; general cone-program
+  coverage is experimental.
+- `ocs.cvxpy_mf` solves a CVXPY problem matrix-free: CVXPY lowers the problem
+  to cones and OCS stops the chain before matrix stuffing, so the constraint
+  matrix is never formed. It uses private CVXPY reductions and is tested
+  against CVXPY 1.6 to 1.9. Sparse matrix constants use ordinary JAX
+  gather/scatter-add operations, without JAX's experimental sparse extension.
+  `ocs.cvxpy_harness` is a **validation harness**,
+  used explicitly and never by the solver: it materializes the stuffed matrix
+  to compare small problems against a reference solver and is for bounded
+  validation only. Both require the `validation` extra:
+  `pip install "ocsolver[validation]==0.3.7"`.
+- Research-only paths (the online and `diagpp`
+  equilibration variants, `ocs.experimental`) are reachable by name and change
+  nothing unless asked for.
+- No performance figure in this README is a benchmark claim; the measured
+  campaigns are reported in the paper that accompanies the release.
 
-## Package layout
+## Source and reporting
 
-```
-ocs/
-  ir.py            the IR:  {x, (K_i, l_i, f_i)}
-  operators/       LinearOperator (matvec/rmatvec): identity, diagonal, dense,
-                   FFTMask, Marginal, Gradient2D/3D, Kronecker, Sylvester, ...
-  prox/            base + POGS calculus + scaling contract; library, cones,
-                   groups (type-grouped GPU dispatch)
-  model/           surface API (Variable, Parameter, terms) + compile()
-  solver/          restart-PDHG engine, matrix-free equilibration + termination
-  cvxpy_harness/   thin validation-only bridge 
-docs/ · examples/ · plots/ · tests/
-```
+The source tree, tests and examples ship in the source distribution
+(`ocsolver-0.3.7.tar.gz`). Run the tests from an installed package with
+`python -m pytest tests` from the unpacked source distribution. Report a
+problem with the output of the identity check above, the `Solution` fields
+`status`, `accuracy_criterion`, `accuracy_detail` and `gap_history`, and a
+problem small enough to attach. A public repository URL is not advertised until
+its location is confirmed.

@@ -3,13 +3,13 @@
     "if I give f as separable, a list of many different f_i, can I efficiently
      evaluate prox_f on a GPU?"
 
-Answer: group blocks by type and launch ONE vmapped kernel per group.  Cost then
-scales with the number of distinct block TYPES, not the number of blocks.
+Group compatible blocks for one vectorized evaluation per group. XLA decides
+the kernel count; work still scales with coordinates and proximal complexity.
 
 We time the stacked dual prox for a growing number of second-order cone blocks
 (all the same type), two ways:
   * naive  : a Python loop calling each block's prox separately;
-  * grouped: build_groups + grouped_moreau_dual (one vmap kernel).
+  * grouped: build_groups + grouped_moreau_dual (one vectorized group).
 
 Run:  python examples/bench_grouped_prox.py
 """
@@ -69,11 +69,11 @@ for B in Bs:
 
 fig, ax = plt.subplots(figsize=(7.5, 5))
 ax.loglog(Bs_naive, naive_t, "s--", lw=2.4, ms=8, color="#d62728", label="naive per-block loop")
-ax.loglog(Bs, group_t, "o-", lw=2.6, ms=8, color="#1f77b4", label="grouped vmap (1 kernel / type)")
+ax.loglog(Bs, group_t, "o-", lw=2.6, ms=8, color="#1f77b4", label="grouped vmap")
 ax.set_xlabel("number of prox blocks (all second-order cones)")
 ax.set_ylabel("dual prox evaluation time (ms)")
 ax.set_title("Type-grouped GPU prox dispatch\n"
-             "a list of many f_i evaluates as one batched kernel per type")
+             "compatible blocks share a vectorized evaluation")
 ax.grid(True, which="both", ls=":", alpha=0.4); ax.legend()
 out = os.path.join(os.path.dirname(__file__), "output", "grouped_prox.png")
 os.makedirs(os.path.dirname(out), exist_ok=True)

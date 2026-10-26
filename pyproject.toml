@@ -1,36 +1,31 @@
 [project]
-name = "ocs"
-version = "0.1.0"
+name = "ocsolver"
+dynamic = ["version"]
 description = "Operator-native convex solver for large-scale optimization on GPUs"
 authors = [{ name = "Miria Feng" }, { name = "Stephen Boyd" }]
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
-    "jax>=0.4",
+    "jax==0.11.1",
     "numpy>=1.24",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Mathematics",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-[project.urls]
-Repository = "https://github.com/cvxgrp/ocs"
-
 [project.optional-dependencies]
-validation = ["cvxpy>=1.4", "scs", "clarabel", "scipy>=1.10"]
+transport = ["jax==0.11.1", "cupy-cuda12x==13.6.0"]
+validation = ["cvxpy>=1.6", "scs", "clarabel", "scipy>=1.10"]
 dev = [
     "matplotlib>=3.8",
     "pytest>=8.0",
-    "cvxpy>=1.4",
+    "cvxpy>=1.6",
     "scs",
     "clarabel",
     "scipy>=1.10",
@@ -38,8 +33,11 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "ocs.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["ocs*"]

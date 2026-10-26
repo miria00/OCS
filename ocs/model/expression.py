@@ -32,7 +32,17 @@ class Parameter:
 
 class AffineExpr:
     """Represents K x + l.  ``offset_fn(data) -> l``; None means l = 0 (so a
-    bare identity term with no offset is recognizable as the primal g)."""
+    bare identity term with no offset is recognizable as the primal g).
+
+    Operator algebra is closed on affine expressions in one variable:
+      * ``A @ (K x + l) = (A K) x + A l``       (operator composition; see
+        ``apply_operator``),
+      * ``(K x + l) ± (K' x + l') = (K ± K') x + (l ± l')``  (operator sum, same
+        variable),
+      * ``c (K x + l) = (cK) x + c l``          (scalar scale).
+    A ``Parameter`` or constant on the right of ``±`` is instead an OFFSET (the
+    per-instance ``l`` term) --- e.g. ``K @ x - y`` with ``y`` a Parameter.
+    """
     def __init__(self, op, var, offset_fn=None):
         self.op = op
         self.var = var
@@ -43,6 +53,23 @@ class AffineExpr:
         return self.op.shape[0]
 
     def _combine(self, other, sign):
+        # (K x + l) ± (K' x + l')  -> sum the operators (same variable)
+        if isinstance(other, (AffineExpr, Variable)):
+            ob = _as_affine(other, self.op.shape[1])
+            if ob.var is not self.var:
+                raise ValueError(
+                    "cannot combine affine expressions in different variables")
+            from ..operators.common import OpSum, Scale
+            rop = ob.op if sign > 0 else Scale(-1.0, ob.op)
+            newop = OpSum(self.op, rop)
+            if self.offset_fn is None and ob.offset_fn is None:
+                off = None
+            else:
+                p = self.offset_fn or (lambda data: 0.0)
+                q = ob.offset_fn or (lambda data: 0.0)
+                off = lambda data, p=p, q=q, s=sign: p(data) + s * q(data)
+            return AffineExpr(newop, self.var, off)
+        # otherwise `other` is a Parameter / constant -> an OFFSET l
         prev = self.offset_fn or (lambda data: 0.0)
         if isinstance(other, Parameter):
             off = lambda data, p=other, s=sign: prev(data) + s * jnp.asarray(
@@ -57,6 +84,45 @@ class AffineExpr:
 
     def __add__(self, other):
         return self._combine(other, +1.0)
+
+    def __mul__(self, c):
+        # scalar scale:  c (K x + l) = (cK) x + c l
+        from ..operators.common import Scale
+        newop = Scale(c, self.op)
+        if self.offset_fn is None:
+            off = None
+        else:
+            prev = self.offset_fn
+            off = lambda data, cc=float(c), p=prev: cc * p(data)
+        return AffineExpr(newop, self.var, off)
+
+    __rmul__ = __mul__
+
+    def __neg__(self):
+        return self.__mul__(-1.0)
+
+    # A @ (this affine) is applied via the operator's __matmul__ -> apply_operator
+
+
+def apply_operator(op, other):
+    """Apply a linear operator to a Variable or AffineExpr, preserving structure.
+
+    ``op @ x``            -> AffineExpr(op, x)
+    ``op @ (K x + l)``    -> AffineExpr(op∘K, x, offset = op · l)
+    The operators stay matrix-free (composed via ``Compose``); no matrix forms.
+    """
+    if isinstance(other, Variable):
+        return AffineExpr(op, other)
+    if isinstance(other, AffineExpr):
+        from ..operators.common import Compose
+        newop = Compose(op, other.op)
+        if other.offset_fn is None:
+            off = None
+        else:
+            prev = other.offset_fn
+            off = lambda data, o=op, p=prev: o.matvec(jnp.asarray(p(data), jnp.float32))
+        return AffineExpr(newop, other.var, off)
+    raise TypeError(f"cannot apply an operator to {type(other).__name__}")
 
 
 def _as_affine(expr, n):

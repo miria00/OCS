@@ -14,7 +14,13 @@ import numpy as np
 import jax.numpy as jnp
 import ocs
 
-m, F, T = 120, 200, 8            # samples, features, tasks
+# Paper scale: F = T = 10^4 -> 10^8 variables in 10^4 row groups.
+# Override with OCS_FS_SMALL=1 for the quick smoke size.
+import os as _os
+if _os.environ.get("OCS_FS_SMALL"):
+    m, F, T = 120, 200, 8
+else:
+    m, F, T = 600, 10000, 10000  # samples, features, tasks
 K_ACTIVE, LAM = 12, 0.5
 rng = np.random.default_rng(0)
 A = rng.normal(size=(m, F)).astype(np.float32)
@@ -29,7 +35,7 @@ b = ocs.Parameter("b")
 # min lam * sum_f ||Theta_{f,:}||_2  +  1/2||A Theta - B||^2
 prob = ocs.minimize([ocs.group_l2(th, lam=LAM, group_size=T),      # row-group lasso (g)
                      ocs.least_squares(K @ th - b)])                # data fidelity
-compiled = prob.compile(max_blocks=1500, tol=1e-4)
+compiled = prob.compile(max_blocks=int(_os.environ.get('OCS_FS_BLOCKS', 120)), tol=1e-3)
 print(compiled, f"  (variable is {F}x{T} matrix = {F*T} vars)")
 
 sol = compiled.solve_instance({"b": jnp.asarray(B.reshape(-1))})

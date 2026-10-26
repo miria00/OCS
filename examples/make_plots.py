@@ -2,13 +2,16 @@
 package clean).  Corrected per review: precise labels, matrix-free termination and
 equilibration both shown, honest baselines and memory markers.
 
-  A  validation battery       LP/QP/SOCP (12 each) vs references: rel-err + r_p/r_d/gap
-  B  bin-packing throughput    OCS batched vs OCS sequential vs cuOpt vs HiGHS
+  A  validation battery       LP/QP/SOCP (12 each) vs references: rel-err + r_p/r_d
+                              plus the LEGACY Fenchel surrogate gap, which is NOT a bound
+  B  CvxCluster throughput     OCS batched vs OCS sequential vs cuOpt vs SCS vs HiGHS
   C  FFT wedge                 runtime/iteration vs N; SCS(dense) line; device-memory markers
   D  SOCP-representable TV MRI  scaling; SCS(dense) line; precise cone/kernel wording
   E  grouped prox dispatch     identical blocks + HETEROGENEOUS types (runtime ~ #groups)
-  F  Kronecker storage         dense explicit A(x)B vs operator factors; extended past 24 GB
+  F  Kronecker storage         dense explicit A(x)B vs operator factors; extended past device memory
   G  matrix-free equilibration  SMFE (Diamond-Boyd) vs scalar on two operator families
+  J  CvxCluster on their turf   their Stage-1 LP at their Table 1 sizes; per-server program
+  K  billion-voxel wedge       3-D imaging on one machine, OCS to 10^9 voxels vs SCS, cuOpt, ODL
 
 Run:  python examples/make_plots.py
 """
@@ -21,8 +24,53 @@ import ocs
 
 PLOTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "plots")
 os.makedirs(PLOTS, exist_ok=True)
-GPU = 24e9
+
+def _device_info():
+    """Hardware label and device memory, measured, never hard-coded."""
+    try:
+        import subprocess
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=20).stdout.strip()
+        name, mem = out.splitlines()[0].split(", ")
+        return name.replace("NVIDIA ", "").strip(), float(mem) * 1e6
+    except Exception:
+        return "CPU", 0.0
+
+DEVNAME, GPU = _device_info()
+HW = f"{DEVNAME}, float32"
 BLUE, GREEN, RED, PURP, ORANGE = "#1f77b4", "#76b900", "#d62728", "#9467bd", "#ff7f0e"
+
+# The accuracy bar for every reported experiment. Tighter tolerances are for
+# diagnostics, not for the paper: 1e-3 is the bar the competitors are also
+# configured against.
+BAR = 1e-3
+
+# Every figure states, first, the problem class that was actually solved, and
+# then which of the three regimes the figure belongs to.
+REGIMES = {
+    1: "Regime 1, scale: the matrix-forming solver runs out, OCS keeps going",
+    2: "Regime 2, batch: compile once and solve many, to the crossover point",
+    3: "Regime 3, their turf: measured against the specialized solver",
+}
+
+
+def headline(fig, problem_class, regime, claim, top=0.88):
+    """Banner: what was solved, which regime, what the figure claims.
+    Call this AFTER tight_layout so the two lines are placed, not squeezed."""
+    fig.text(0.5, 0.965, problem_class, ha="center", va="center",
+             fontsize=12.5, fontweight="bold")
+    fig.text(0.5, 0.917, f"{REGIMES[regime]}   |   {claim}",
+             ha="center", va="center", fontsize=8.8, color="#444444")
+
+
+def tidy_log_ticks(*axes):
+    """Log minor-tick labels collide on wide ranges; keep decade labels only."""
+    from matplotlib.ticker import NullFormatter
+    for a in axes:
+        a.xaxis.set_minor_formatter(NullFormatter())
+        a.yaxis.set_minor_formatter(NullFormatter())
+
 
 
 def A_validation_battery():
@@ -78,14 +126,15 @@ def A_validation_battery():
     rows.append(["OT (reg)  ⟨C,X⟩, marginals", "1", "POT emd2", f"{abs(oo-rr)/(1+abs(rr)):.1e}", "—", "—", "—", "—"])
 
     fig, ax = plt.subplots(figsize=(13.5, 3.2)); ax.axis("off")
-    cols = ["problem class", "n", "reference", "median rel-err", "worst rel-err", "worst r_p", "worst r_d", "worst gap"]
+    cols = ["problem class", "n", "reference", "median rel-err", "worst rel-err", "worst r_p", "worst r_d", "worst surrogate gap"]
     tbl = ax.table(cellText=rows, colLabels=cols, cellLoc="center", loc="center",
                    colWidths=[0.24, 0.05, 0.11, 0.12, 0.12, 0.10, 0.10, 0.10])
     tbl.auto_set_font_size(False); tbl.set_fontsize(9.5); tbl.scale(1, 1.7)
     for j in range(len(cols)): tbl[0, j].set_facecolor("#e8e8e8")
     for i in range(1, len(rows)+1): tbl[i, 0].set_text_props(ha="left")
     ax.set_title("Validation on small LP/QP/SOCP (OCS float32, relative tolerance 1e-3)\n"
-                 "objective agreement AND matrix-free termination certificate (r_p, r_d, gap)", fontsize=11.5, pad=12)
+                 "objective agreement AND matrix-free termination certificate (r_p, r_d); "
+                 "the gap column is the LEGACY Fenchel surrogate, not a bound", fontsize=11.5, pad=12)
     fig.tight_layout(); fig.savefig(os.path.join(PLOTS, "A_validation_battery.png"), dpi=150); plt.close(fig)
     print("A: battery", rows[0][3:], "| OT rel-err", rows[-1][3])
 
@@ -96,7 +145,7 @@ def B_binpack_throughput():
     K = ocs.BinPack(Rmat, B); negK = ocs.Weighted(K, -1.0)
     x = ocs.Variable(I*B); rhs = ocs.Parameter("rhs"); cost = ocs.Parameter("c")
     se = jnp.full(I*B, np.sqrt(0.1), jnp.float32)
-    comp = ocs.minimize([ocs.nonneg(x), ocs.nonneg(negK@x+rhs), ocs.sum_squares(ocs.Diagonal(se)@x)], cost=cost).compile(max_blocks=500, tol=1e-12)
+    comp = ocs.minimize([ocs.nonneg(x), ocs.nonneg(negK@x+rhs), ocs.sum_squares(ocs.Diagonal(se)@x)], cost=cost).compile(max_blocks=500, tol=BAR)
     rng = np.random.default_rng(4); per = 0.6*Rmat.sum(1)/B
     def inst():
         C = (per[:, None]*rng.uniform(.7, 1.3, (R, B))).astype("f"); w = rng.uniform(.5, 1.5, I).astype("f")
@@ -138,18 +187,39 @@ def B_binpack_throughput():
                 color=BLUE, fontsize=8.5, arrowprops=dict(arrowstyle="->", color=BLUE))
     ax.axhline(ocs_seq, ls="-.", lw=2.0, color=BLUE, alpha=.6, label=f"OCS sequential (solve_instance loop, ~{ocs_seq:.0f}/s)")
     import csv as _csv
-    cf = os.path.join(PLOTS, "competitors_binpack.csv")
+    cf = os.environ.get("BINPACK_CSV", os.path.join(PLOTS, "competitors_binpack.csv"))
     if os.path.exists(cf):
-        col = {"cuPDLP": GREEN, "cuOpt(simplex)": "#8c564b", "HiGHS": PURP, "cuOpt(PDLP)": GREEN}
+        col = {"cuPDLP": GREEN, "cuOpt(simplex)": "#8c564b", "HiGHS": PURP,
+               "cuOpt(PDLP)": GREEN, "CUOPT": GREEN, "HIGHS": PURP, "SCS": RED,
+               "CUOPT_QP_PDLP": "#2ca02c", "CUOPT_QP_BARRIER": "#8c564b"}
+        pretty = {"CUOPT": "cuOpt via CVXPY (SOC lift, barrier)", "HIGHS": "HiGHS", "SCS": "SCS",
+                  "CUOPT_QP_PDLP": "cuOpt PDLP (native QP API)",
+                  "CUOPT_QP_BARRIER": "cuOpt barrier (native QP API)"}
         for row in _csv.DictReader(open(cf)):
-            tp = float(row["throughput_per_s"]); ax.axhline(tp, ls="--", lw=2.2, color=col.get(row["solver"], "gray"), label=f"{row['solver']} sequential (~{tp:.0f}/s)")
-    ax.set_xlabel("batch size  N  (bin-packing instances, different capacities & profits)")
+            if not row.get("throughput_per_s"):
+                continue                      # solver failed; nothing to draw
+            tp = float(row["throughput_per_s"])
+            name = pretty.get(row["solver"], row["solver"])
+            # each competitor is given the same compile-once courtesy as OCS,
+            # so these are solve rates, not canonicalization rates
+            rate = f"{tp:.2f}" if tp < 10 else f"{tp:.0f}"
+            ax.axhline(tp, ls="--", lw=2.2, color=col.get(row["solver"], "gray"),
+                       label=f"{name} sequential, parametric (~{rate}/s)")
+    ax.set_xlabel("batch size  N  (CvxCluster scheduler instances, different capacities and profits)")
     ax.set_ylabel("throughput (instances / second)")
-    ax.set_title("Repeated-solve LP: bin packing (fixed K, many data)\n"
-                 "3 synchronized reps; JIT excluded; equilibration amortized; same 1e-3 for all")
+    ax.set_title("Repeated parametric solves: CvxCluster Stage-1 relaxation (fixed operator, many data)\n"
+                 "3 synchronized reps; JIT excluded; equilibration amortized\n"
+                 "OCS residual tolerance 1e-3; baselines at their own settings, see caption", fontsize=10.5)
     ax.grid(True, which="both", ls=":", alpha=.4); ax.legend(fontsize=8.5)
-    fig.text(0.5, 0.012, "4,800 variables/instance (120 items × 40 bins).  RTX 4090, float32.", ha="center", fontsize=8, color="dimgray")
-    fig.tight_layout(rect=[0, 0.04, 1, 1]); fig.savefig(os.path.join(PLOTS, "B_binpack_throughput.png"), dpi=150); plt.close(fig)
+    fig.text(0.5, 0.012, f"CvxCluster Stage-1 relaxation, whose structure is a fractional bin-packing problem.\n"
+             f"4,800 variables/instance (120 tasks × 40 server shapes).  {HW}.", ha="center", fontsize=8, color="dimgray")
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+    png = os.environ.get("BINPACK_PNG", os.path.join(PLOTS, "B_binpack_throughput.png"))
+    fig.savefig(png, dpi=150); plt.close(fig)
+    with open(os.path.splitext(png)[0] + "_ocs.csv", "w", newline="") as fh:   # the OCS record behind the figure
+        w = _csv.writer(fh); w.writerow(["N", "ocs_monolithic_per_s", "ocs_microbatched_per_s", "ocs_sequential_per_s", "tol", "tile", "hardware"])
+        for N, a, b in zip(Ns, thr, thr_micro):
+            w.writerow([N, round(a, 3), round(b, 3), round(ocs_seq, 3), BAR, TILE, HW])
     print(f"B: seq {ocs_seq:.0f}/s | mono {[round(v) for v in thr]} | micro {[round(v) for v in thr_micro]} inst/s @ N={Ns}")
 
 
@@ -165,6 +235,72 @@ def _fft_runtime(Ns, budget=5, block=100):
         ts.append(time.perf_counter()-t)
         res.append(float(o[3][0])); iters.append(int(o[2][0]) * block)   # iterations ACTUALLY executed
     return ts, res, iters
+
+
+
+def H_ot_wedge():
+    """The flagship example's wedge: optimal transport with a matrix variable.
+    OCS never forms the marginal operator; a matrix-forming solver must store a
+    2N x N^2 constraint matrix.  The specialized-OT reference (POT Sinkhorn) is
+    plotted to show we are in its ballpark, per the paper's stated aim."""
+    import csv as _csv
+    f = os.path.join(PLOTS, "ot_wedge.csv")
+    if not os.path.exists(f):
+        print("   (skip H_ot_wedge: run the OT sweep first)"); return
+    N, V, T, S = [], [], [], []
+    for row in _csv.DictReader(open(f)):
+        N.append(float(row["N"])); V.append(float(row["vars"]))
+        T.append(float(row["ocs_s"])); S.append(float(row["sinkhorn_s"]))
+    N, V, T, S = map(np.array, (N, V, T, S))
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12.4, 5.0))
+
+    # --- left: solve time vs problem size, against the specialized solver ---
+    ax.loglog(V, T, "o-", lw=2.6, ms=7, color=BLUE, label="OCS (matrix-free marginal operator)")
+    ax.loglog(V, S, "s--", lw=2.2, ms=6, color=PURP, label="POT Sinkhorn (specialized OT, CPU)")
+    ax.annotate(f"$10^8$ variables\nin {T[-1]:.1f} s", (V[-1], T[-1]),
+                xytext=(V[-1]*0.035, T[-1]*0.9), color=BLUE, fontsize=9,
+                ha="center", arrowprops=dict(arrowstyle="->", color=BLUE, lw=1.2))
+    ax.set_xlabel("transport plan size  $N^2$  (variables)")
+    ax.set_ylabel("solve time (s)")
+    ax.set_title("Optimal transport: solve time")
+    ax.grid(True, which="both", ls=":", alpha=.4); ax.legend(loc="upper left", fontsize=9)
+
+    # --- right: storing the CONSTRAINT REPRESENTATION (not the plan/cost, which
+    #     every method needs) -- this is the quantity that decides feasibility ---
+    Ng = np.logspace(np.log10(64), np.log10(3e4), 200)
+    dense_b  = 2 * Ng * Ng**2 * 4.0     # (2N) x N^2 dense f32
+    sparse_b = 2 * Ng**2 * 8.0          # 2N^2 nonzeros: f32 value + int32 index
+    ocs_b    = 8 * Ng                   # OCS: two index/shape vectors, O(N)
+    ax2.loglog(Ng**2, dense_b, "-", lw=2.4, color=RED, label="dense matrix $(2N)\\times N^2$")
+    ax2.loglog(Ng**2, sparse_b, "-", lw=2.4, color=PURP, label="sparse matrix ($2N^2$ nonzeros)")
+    ax2.loglog(Ng**2, ocs_b, "-", lw=2.8, color=BLUE, label="OCS marginal operator: $O(N)$ metadata")
+    ax2.axhline(GPU, color=GREEN, lw=2.2, ls="--")
+    ax2.text(Ng[0]**2*1.6, GPU*1.6, f"{GPU/1e9:.0f} GB device memory", color="#3f6000", fontsize=9)
+    for arr, col, lab in ((dense_b, RED, "dense"), (sparse_b, PURP, "sparse")):
+        idx = int(np.argmax(arr > GPU))
+        if idx:
+            ax2.axvline(Ng[idx]**2, color=col, ls=":", lw=1.5)
+            ax2.text(Ng[idx]**2*1.3, 2e1, f"{lab} exceeds the\ndevice at $N\\approx{int(Ng[idx]):,}$",
+                     color=col, fontsize=8.5, rotation=90, va="bottom")
+    ax2.axvline(1e8, color=BLUE, lw=1.4, ls="-.")
+    ax2.text(6.5e7, 4e1, "our run", color=BLUE, fontsize=8.5, rotation=90,
+             va="bottom", ha="right")
+    ax2.set_ylim(1e1, 1e16)
+    ax2.set_xlabel("transport plan size  $N^2$  (variables)")
+    ax2.set_ylabel("storage for the constraint representation (bytes)")
+    ax2.set_title("Optimal transport: why the operator form is necessary")
+    ax2.grid(True, which="both", ls=":", alpha=.4); ax2.legend(loc="upper left", fontsize=8.5)
+
+    fig.text(0.5, 0.030, "Left: " + HW + "; relative residual below $10^{-4}$ at every point, marginal error "
+             "$1.6\\times10^{-4}$ at $N=10^4$. POT Sinkhorn, same regularization, CPU float64.",
+             ha="center", fontsize=7.5, color="dimgray")
+    fig.text(0.5, 0.008, "Right: the constraint representation only -- the cost $C$ and the plan $X$ are $N^2$-sized "
+             "for every method, so they are not what decides feasibility.",
+             ha="center", fontsize=7.5, color="dimgray")
+    fig.tight_layout(rect=[0, 0.062, 1, 1])
+    fig.savefig(os.path.join(PLOTS, "H_ot_wedge.png"), dpi=150); plt.close(fig)
+    print("   wrote H_ot_wedge.png")
 
 
 def C_fft_wedge():
@@ -196,14 +332,14 @@ def C_fft_wedge():
             ax.loglog(pn, ps, "^--", lw=2.2, ms=7, color=GREEN, label="NVIDIA cuOpt barrier, explicitly formed dense QP")
             ax.annotate(f"cuOpt OOM forming\ndense QP past N~{int(pn[-1]):,}", (pn[-1], ps[-1]), xytext=(pn[-1]*0.12, ps[-1]*3.0), color="#3f6000", fontsize=8.5)
     # precise device-memory markers
-    n_op24 = np.sqrt(GPU/2)                                # 2m x N real f32 = 2 N^2 bytes > 24 GB
+    n_op24 = np.sqrt(GPU/2)                                # 2m x N real f32 = 2 N^2 bytes > device memory
     n_oom = None
     cf = os.path.join(PLOTS, "competitors_fft.csv")
     if os.path.exists(cf):
         for row in _csv.DictReader(open(cf)):
             if "OOM" in row["status"]: n_oom = int(row["N"]); break
     ax.axvline(n_op24, color=GREEN, lw=2.4); ax.axvspan(n_op24, Ns[-1]*1.5, color=GREEN, alpha=.08)
-    ax.text(n_op24*1.12, min(ts)*2.2, "estimated: explicit operator\nalone > 24 GB device memory", color="#3f6000", fontsize=8.5)
+    ax.text(n_op24*1.12, min(ts)*2.2, f"estimated: explicit operator\nalone > {GPU/1e9:.0f} GB device memory", color="#3f6000", fontsize=8.5)
     if n_oom:
         ax.axvline(n_oom, color="gray", ls=":", lw=1.6); ax.text(n_oom*1.05, max(ts)*0.5, f"measured: host OOM forming\noperator at N={n_oom:,}", color="gray", fontsize=8)
     ax.set_xlabel("problem size  N  (variables)"); ax.set_ylabel(f"wall time for a fixed {NIT}-iteration budget (s)")
@@ -211,10 +347,12 @@ def C_fft_wedge():
                  "each OCS iteration is O(N log N); the tested CVXPY/SCS canonicalization can't form the operator at scale")
     ax.grid(True, which="both", ls=":", alpha=.4); ax.legend(loc="upper left", fontsize=8.5)
     fig.text(0.5, 0.012, f"Fixed budget: exactly {NIT} iterations executed at every N (= {2*NIT} matrix-free FFTs: 1 matvec + 1 rmatvec each); "
-             f"GPU-synchronized. All OCS points finish below tolerance, residual in [{min(res):.0e}, {max(res):.0e}].  RTX 4090, float32.",
+             f"GPU-synchronized. Fixed budget, so the tolerance is deliberately not the stopping rule; "
+             f"every point reaches residual in [{min(res):.0e}, {max(res):.0e}], "
+             f"{'all within' if max(res) <= BAR else 'NOT all within'} the {BAR:g} bar.  {HW}.",
              ha="center", fontsize=7.5, color="dimgray")
     fig.tight_layout(rect=[0, 0.045, 1, 1]); fig.savefig(os.path.join(PLOTS, "C_fft_wedge.png"), dpi=150); plt.close(fig)
-    print(f"C: {NIT} iters (constant); OCS@N=4M {ts[-1]:.2f}s; residual range [{min(res):.1e},{max(res):.1e}]; 24GB wall N~{n_op24:,.0f}")
+    print(f"C: {NIT} iters (constant); OCS@N=4M {ts[-1]:.2f}s; residual range [{min(res):.1e},{max(res):.1e}]; {GPU/1e9:.0f}GB wall N~{n_op24:,.0f}")
 
 
 def D_mri_scale():
@@ -238,20 +376,42 @@ def D_mri_scale():
     import csv as _csv
     ctm = os.path.join(PLOTS, "competitors_mri_time.csv")
     if os.path.exists(ctm):
-        cc = []; cs = []
+        cc = []; cs = []; stopped = None
         for row in _csv.DictReader(open(ctm)):
-            if row["status"] == "solved": cc.append(float(row["cones"])); cs.append(float(row["scs_solve_s"]))
+            if row["status"] == "solved":
+                cc.append(float(row["cones"])); cs.append(float(row["scs_solve_s"]))
+            elif stopped is None:
+                stopped = (float(row["cones"]), row["status"])
         if cc:
             ax.loglog(cc, cs, "s--", lw=2.2, ms=7, color=PURP, label="CVXPY/SCS, explicitly formed dense operator")
-            ax.annotate(f"SCS impractical\n({cs[-1]:.0f}s at {int(cc[-1]):,} px)", (cc[-1], cs[-1]), xytext=(cc[-1]*0.28, cs[-1]*0.42), color=PURP, fontsize=8.5)
+            why = {"killed_out_of_memory": "killed by the\nout-of-memory killer",
+                   "out_of_memory": "out of memory",
+                   }.get(stopped[1] if stopped else "", None)
+            if stopped and why:
+                # say why the competitor's line ends, rather than just ending it
+                ax.plot([stopped[0]], [cs[-1]], "x", ms=13, mew=3, color=RED)
+                ax.annotate(f"SCS {why}\nat {int(stopped[0]):,} px",
+                            (stopped[0], cs[-1]), xytext=(stopped[0]*0.10, cs[-1]*0.30),
+                            color=RED, fontsize=8.5,
+                            arrowprops=dict(arrowstyle="->", color=RED, lw=1.2))
+            else:
+                # a time wedge, not a memory wedge: say which
+                ax.annotate(f"SCS: {cs[-1]/60:.0f} min at {int(cc[-1]):,} px",
+                            (cc[-1], cs[-1]), xytext=(cc[-1]*0.22, cs[-1]*0.30),
+                            color=PURP, fontsize=8.8,
+                            arrowprops=dict(arrowstyle="->", color=PURP, lw=1.2))
     ax.axvline(n_op24, color=GREEN, lw=2.4); ax.axvspan(n_op24, cones[-1]*1.5, color=GREEN, alpha=.08)
-    ax.text(n_op24*1.12, min(ts)*1.7, "estimated lower bound: explicit\noperator alone > 24 GB device memory", color="#3f6000", fontsize=8.5)
+    ax.text(n_op24*1.12, min(ts)*1.7, f"estimated lower bound: explicit\noperator alone > {GPU/1e9:.0f} GB device memory", color="#3f6000", fontsize=8.5)
     ax.set_xlabel("number of TV pixels  (2-D reconstruction; one grouped ℓ₂ prox block of size 2 per pixel)"); ax.set_ylabel(f"wall time for a fixed {NIT}-iteration budget (s)")
     ax.set_title("SOCP-representable isotropic-TV MRI (FFT + gradient operators stay matrix-free)\n"
                  "one batched prox evaluation per block type; the tested explicit conic form can't scale")
     ax.grid(True, which="both", ls=":", alpha=.4); ax.legend(loc="upper left", fontsize=8.5)
     fig.text(0.5, 0.012, f"Fixed budget: exactly {NIT} iterations executed at every size, GPU-synchronized. "
-             f"All OCS points finish below tolerance, residual in [{min(res):.0e}, {max(res):.0e}].  RTX 4090, float32.",
+             f"Fixed budget, so the tolerance is deliberately not the stopping rule; every point "
+             f"reaches residual in [{min(res):.0e}, {max(res):.0e}], "
+             f"{'all within' if max(res) <= BAR else 'NOT all within'} the {BAR:g} bar.  "
+             f"A time wedge, not a memory wedge: SCS needs 25 min at 16,384 px where OCS reaches "
+             f"1,048,576 px, 64x larger, in {ts[-1]:.2f} s.  {HW}.",
              ha="center", fontsize=7.5, color="dimgray")
     fig.tight_layout(rect=[0, 0.045, 1, 1]); fig.savefig(os.path.join(PLOTS, "D_mri_socp_scale.png"), dpi=150); plt.close(fig)
     print(f"D: {NIT} iters (constant); OCS to {int(cones[-1]):,} px {ts[-1]:.2f}s; residual range [{min(res):.1e},{max(res):.1e}]")
@@ -305,7 +465,7 @@ def E_grouped_prox():
     ax2.set_xticks(Ts); ax2.set_title("(b) heterogeneous: grouped runtime stays low across 1–8 prox types")
     ax2.grid(True, ls=":", alpha=.4); ax2.legend(fontsize=9)
     fig.suptitle("Type-grouped GPU prox dispatch: a separable list of many, possibly different, fᵢ is evaluated with one batched dispatch per type", fontsize=12)
-    fig.text(0.5, 0.012, "JIT warmup excluded; every timing block_until_ready-synchronized; best of 5×100 reps.  RTX 4090, float32.",
+    fig.text(0.5, 0.012, f"JIT warmup excluded; every timing block_until_ready-synchronized; best of 5×100 reps.  {HW}.",
              ha="center", fontsize=8, color="dimgray")
     fig.tight_layout(rect=[0, 0.04, 1, 1]); fig.savefig(os.path.join(PLOTS, "E_grouped_prox.png"), dpi=150); plt.close(fig)
     print(f"E: identical 512-blk {nt[-1]/gt[Bg.index(512)]:.0f}x; heterogeneous grouped {g_t[0]:.3f}->{g_t[-1]:.3f}ms over 1->8 types")
@@ -321,17 +481,407 @@ def F_kronecker_storage():
     ax.loglog(Ts, mat_dense, "s--", lw=2.4, ms=7, color=RED, label="dense explicit A⊗B  (S²T² floats)")
     ax.loglog(Ts, op, "o-", lw=2.6, ms=7, color=BLUE, label="OCS operator: store factors A, B  (S²+T²)")
     ax.axhline(GPU/1e9, color=GREEN, ls=":", lw=1.6)
-    cross = np.sqrt(GPU/4)/S                               # (ST)^2*4 = 24GB
-    ax.text(Ts[-1]*0.42, GPU/1e9*1.5, "24 GB (RTX 4090)", color="#3f6000", fontsize=9)
+    cross = np.sqrt(GPU/4)/S                               # (ST)^2*4 = device memory
+    ax.text(Ts[-1]*0.42, GPU/1e9*1.5, f"{GPU/1e9:.0f} GB ({DEVNAME})", color="#3f6000", fontsize=9)
     r = mat_dense[-1]/op[-1]
     ax.annotate(f"at T={int(Ts[-1])}: dense is {r:,.0f}× larger", (Ts[-1], mat_dense[-1]), xytext=(Ts[3], mat_dense[-1]*0.02), color=RED, fontsize=9,
                 arrowprops=dict(arrowstyle="->", color=RED))
     ax.set_xlabel(f"T  (matrix variable {S}×T; A is {S}×{S}, B is T×T)"); ax.set_ylabel("storage (GB)")
-    ax.set_title("Matrix-variable / Kronecker storage vs horizon\n"
+    ax.set_title("Matrix-variable / Kronecker storage against $T$\n"
                  "the operator stores only the factors; the dense explicit Kronecker grows as S²T²")
     ax.grid(True, which="both", ls=":", alpha=.4); ax.legend(loc="upper left", fontsize=9)
     fig.tight_layout(); fig.savefig(os.path.join(PLOTS, "F_kronecker_storage.png"), dpi=150); plt.close(fig)
-    print(f"F: dense crosses 24GB at T~{cross:.0f}; at T={int(Ts[-1])} dense {r:,.0f}x operator")
+    print(f"F: dense crosses {GPU/1e9:.0f}GB at T~{cross:.0f}; at T={int(Ts[-1])} dense {r:,.0f}x operator")
+
+
+
+def I_rof_spdhg():
+    """Regime 3: ROF denoising against the authors' own SPDHG implementation.
+    Problem, image, noise seed and every step-size constant are Ehrhardt's
+    (github.com/mehrhardt/spdhg, example_rof.py); the algorithm is [CERS18]."""
+    import csv as _csv
+    f = os.path.join(PLOTS, "rof_spdhg_vs_ocs.csv")
+    if not os.path.exists(f):
+        print("   (skip I_rof_spdhg: run examples/rof_spdhg_vs_ocs.py first)"); return
+    series = {}
+    for row in _csv.DictReader(open(f)):
+        series.setdefault(row["method"], []).append(
+            (float(row["wall_s"]), float(row["objective"])))
+    best = min(J for v in series.values() for _, J in v)
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12.4, 5.2))
+    style = {"OCS": ("o-", BLUE, 2.8), "SPDHG-CPU": ("s--", PURP, 2.2),
+             "SPDHG-GPU": ("^:", ORANGE, 2.0), "SplitBregman": ("d-.", RED, 2.2)}
+    for name, pts in series.items():
+        t = np.array([p[0] for p in pts]); J = np.array([p[1] for p in pts])
+        gap = np.maximum((J - best) / abs(best), 1e-12)
+        mk, col, lw = style.get(name, ("d-.", RED, 2.0))
+        ax.loglog(t, gap, mk, lw=lw, ms=5, color=col, label=name)
+
+    # the headline number: time for each method to reach one common accuracy
+    TARGET = 2e-4
+    reach = {}
+    for name, pts in series.items():
+        for t, J in sorted(pts):
+            if (J - best) / abs(best) <= TARGET:
+                reach[name] = t; break
+    floors = {n: min(J for _, J in v) for n, v in series.items()}
+    for name, fl in floors.items():
+        rel = (fl - best) / abs(best)
+        seq = [J for _, J in sorted(series[name])]
+        stalled = len(seq) > 1 and (seq[-2] - seq[-1]) / abs(best) < 1e-9
+        if rel > 1e-5 and stalled:          # its own fixed point, not our optimum
+            t_at = min(t for t, J in series[name] if J <= fl * (1 + 1e-9))
+            ax.axhline(rel, color=style.get(name, ("", RED, 0))[1], lw=1.0,
+                       ls=":", alpha=.7)
+            ax.annotate(f"{name} converges to its own\ndiscretization, floor {rel:+.3%}",
+                        (t_at, rel), xytext=(t_at*0.16, rel*3.0), fontsize=8.0,
+                        color=style.get(name, ("", RED, 0))[1],
+                        arrowprops=dict(arrowstyle="->", lw=1.0,
+                                        color=style.get(name, ("", RED, 0))[1]))
+    ax.axhline(TARGET, color="k", lw=1.1, ls="--", alpha=.6)
+    ax.text(ax.get_xlim()[0]*1.4, TARGET*1.35, f"common target: relative gap {TARGET:g}",
+            fontsize=8.2, color="k")
+    ax.set_xlabel("wall time (s), solve only"); ax.set_ylabel("relative objective gap")
+    ax.set_title("Time to a common accuracy")
+    ax.grid(True, which="both", ls=":", alpha=.4); ax.legend(loc="lower left", fontsize=8.8)
+
+    order = [n for n in ("SplitBregman", "SPDHG-CPU", "SPDHG-GPU", "OCS") if n in series]
+    names, vals, cols, hatch = [], [], [], []
+    ceiling = max(list(reach.values()) + [1.0])
+    for n in order:
+        names.append(n)
+        vals.append(reach.get(n, ceiling))
+        cols.append(style.get(n, ("", RED, 0))[1])
+        hatch.append("" if n in reach else "///")
+    bars = ax2.bar(names, vals, color=cols, width=.6)
+    for b, h in zip(bars, hatch):
+        if h:
+            b.set_hatch(h); b.set_alpha(.45)
+    ax2.set_yscale("log"); ax2.set_ylabel("wall time to reach the common target (s)")
+    ax2.set_title("Same problem, same target, measured")
+    ax2.grid(True, axis="y", which="both", ls=":", alpha=.4)
+    for b, v, n in zip(bars, vals, names):
+        lab = f"{v:.3g} s" if n in reach else "never\nreaches it"
+        ax2.text(b.get_x() + b.get_width()/2, v*1.15, lab,
+                 ha="center", fontsize=9.0,
+                 fontweight="bold" if n in reach else "normal")
+    if "OCS" in reach and "SPDHG-CPU" in reach:
+        sp = reach["SPDHG-CPU"] / reach["OCS"]
+        ax2.text(.5, .93, f"OCS reaches the same objective {sp:,.0f}x sooner",
+                 transform=ax2.transAxes, ha="center", fontsize=10.5,
+                 color=BLUE, fontweight="bold")
+
+    tidy_log_ticks(ax)
+    fig.tight_layout(rect=[0, 0.052, 1, 0.88])
+    headline(fig, "ROF denoising (isotropic-free anisotropic TV + squared-\u2113\u2082 fidelity), "
+                        "442\u00d7331 = 146,302 pixels", 3,
+             "OCS matches the specialized stochastic method's objective in far less time")
+    fig.text(0.5, 0.028,
+             "SPDHG is the reference implementation in odl.contrib.solvers.spdhg with the parameters of "
+             "Ehrhardt's own example_rof.py (alpha=0.12, gamma=0.99, two subsets); the image, the noise "
+             "and the seed are his. " + HW + ".",
+             ha="center", fontsize=7.5, color="dimgray")
+    fig.text(0.5, 0.008,
+             "SPDHG runs through ODL's own operators, proximal functions and backend, as its authors "
+             "distribute it. Split Bregman [GO09] is scikit-image's implementation, and its own "
+             "discretization gives it a different fixed point.",
+             ha="center", fontsize=7.5, color="dimgray")
+    fig.savefig(os.path.join(PLOTS, "I_rof_spdhg.png"), dpi=150); plt.close(fig)
+    print(f"   wrote I_rof_spdhg.png  (reach: {reach})")
+
+
+def F_kronecker_wedge():
+    """Regime 1, measured: the Kronecker/matrix-variable family.  OCS applies the
+    factors; the explicit form must be built, and stops being buildable."""
+    import csv as _csv
+    f = os.path.join(PLOTS, "kron_wedge.csv")
+    if not os.path.exists(f):
+        print("   (skip F_kronecker_wedge: run examples/kron_wedge.py first)")
+        return F_kronecker_storage()
+    T, V, ocs_t, ocs_pk, d_gb, d_t, d_st = [], [], [], [], [], [], []
+    for row in _csv.DictReader(open(f)):
+        T.append(float(row["T"])); V.append(float(row["vars"]))
+        ocs_t.append(float(row["ocs_s"])); ocs_pk.append(float(row["ocs_peak_gb"]))
+        d_gb.append(float(row["dense_gb"])); d_st.append(row["dense_status"])
+        d_t.append(float(row["dense_solve_s"]) if row["dense_solve_s"] else np.nan)
+    T, V, ocs_t, ocs_pk, d_gb, d_t = map(np.array, (T, V, ocs_t, ocs_pk, d_gb, d_t))
+    built = np.array([st == "formed" for st in d_st])
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12.4, 5.2))
+    ax.loglog(V, ocs_t, "o-", lw=2.8, ms=7, color=BLUE,
+              label="OCS, applies the factors $A$ and $B$")
+    if built.any():
+        ax.loglog(V[built], d_t[built], "s--", lw=2.2, ms=7, color=RED,
+                  label="explicit $A\\otimes B$: numpy float32 kron + one dense lstsq, host")
+        last = int(np.where(built)[0][-1])
+        if last + 1 < len(built):                      # a larger size was refused
+            why = {"out_of_memory": "not formed:\nout of memory (measured)",
+                   "exceeds_memory_budget": "not attempted past here: declared budget",
+                   }.get(d_st[last + 1], "the explicit form\nstops here")
+            ax.annotate(why, (V[last], d_t[last]),
+                        xytext=(V[last]*1.5, d_t[last]*0.02), color=RED, fontsize=8.8, ha="left",
+                        arrowprops=dict(arrowstyle="->", color=RED, lw=1.2))
+    ax.set_xlabel("variables  $ST$"); ax.set_ylabel("solve time (s)")
+    ax.set_title("Solve time, measured")
+    ax.grid(True, which="both", ls=":", alpha=.4); ax.set_ylim(top=max(ax.get_ylim()[1], 2e5)); ax.legend(loc="upper left", fontsize=8.8)
+
+    ax2.loglog(V, ocs_pk, "o-", lw=2.8, ms=7, color=BLUE,
+               label="OCS peak device memory (measured)")
+    ax2.loglog(V, d_gb, "s--", lw=2.2, ms=7, color=RED,
+               label="explicit $A\\otimes B$ alone ($S^2T^2$ floats)")
+    ax2.axhline(GPU/1e9, color=GREEN, ls=":", lw=1.8)
+    ax2.set_ylim(top=max(GPU/1e9, np.nanmax(d_gb)) * 6)
+    ax2.text(V[-1], GPU/1e9*1.45, f"{GPU/1e9:.0f} GB ({DEVNAME})",
+             color="#3f6000", fontsize=9, ha="right")
+    ax2.set_xlabel("variables  $ST$"); ax2.set_ylabel("memory (GB)")
+    ax2.set_title("Memory: measured for OCS, required for the explicit form")
+    ax2.grid(True, which="both", ls=":", alpha=.4); ax2.legend(loc="upper left", fontsize=8.8)
+
+    tidy_log_ticks(ax, ax2)
+    fig.tight_layout(rect=[0, 0.042, 1, 0.88])
+    headline(fig, f"Kronecker-structured lasso, $\\min\\ \\frac{{1}}{{2}}\\|(A\\otimes B)"
+                        f"\\mathrm{{vec}}(X)-b\\|_2^2+\\lambda\\|\\mathrm{{vec}}(X)\\|_1$, "
+                        f"$X$ of size {int(V[0]/T[0])}\u00d7T", 1,
+             "OCS stays flat in time and memory; the explicit Kronecker matrix is refused past a declared budget")
+    fig.text(0.5, 0.020,
+             "Both sides solve the same instance. OCS memory is the measured device peak; the explicit "
+             "column is the matrix alone in float32, the most generous accounting for it.  "
+             "OCS is held to a 1e-6 residual here, tighter than the 1e-3 bar used elsewhere, and its "
+             "achieved residuals are reported in the CSV.  " + HW + ".",
+             ha="center", fontsize=7.5, color="dimgray")
+    fig.savefig(os.path.join(PLOTS, "F_kronecker_wedge.png"), dpi=150); plt.close(fig)
+    print(f"   wrote F_kronecker_wedge.png  (OCS to {int(V[-1]):,} vars in {ocs_t[-1]:.3f}s)")
+
+
+def J_cvxcluster_turf():
+    """Regime 3: the CvxCluster Stage-1 pricing LP of Nnorom, Boyd and Levis
+    (arXiv 2605.01614), their formulation and their Table 1 sizes, every
+    measured solver on the same machine; their Gurobi times as they report
+    them.  Data: examples/cvxcluster_turf.py -> plots/cvxcluster_turf.csv."""
+    import csv as _csv
+    f = os.environ.get("TURF_CSV", os.path.join(PLOTS, "cvxcluster_turf.csv"))
+    if not os.path.exists(f):
+        print("   (skip J_cvxcluster_turf: run examples/cvxcluster_turf.py first)"); return
+    last = {}                                   # the latest row per configuration
+    for row in _csv.DictReader(open(f)):
+        key = (row["mode"], int(row["tasks"]), int(row["servers"]), row["solver"], float(row["tol"]))
+        last[key] = row
+    OK = ("solved", "Optimal", "Optimization terminated successfully")
+    _short = lambda st: {"Time limit reached": "time limit", "timeout": "timeout", "killed": "killed",
+                         "out_of_memory": "out of memory", "killed_out_of_memory": "out of memory",
+                         "NoTermination": "no result", "The HiGHS status code was not recognized": "no result",
+                         "inaccurate": "budget, not converged"}.get(
+                         st.split("(")[0].strip(), st.split("(")[0].strip()[:16])
+    _fmtn = lambda v: f"{v/1e6:.3g}M" if v >= 1e6 else f"{v:,}"
+
+    def series(mode, solver, tol=None):
+        pts = []
+        for (m, t, s, sv, tl), r in sorted(last.items(), key=lambda kv: kv[0][1] * kv[0][2]):
+            if m != mode or sv != solver or (tol is not None and tl != tol):
+                continue
+            ok = any(r["status"].startswith(o) for o in OK)
+            tm = r["warm_s"] if sv == "OCS" else r["solve_s"]
+            tm = float(tm) if tm not in ("", None) else float("nan")
+            pts.append((t, s, int(r["variables"]), tm, ok, r["status"]))
+        return pts
+
+    style = {("OCS", 1e-3): ("o-", BLUE, 2.8, "OCS, 1e-3 (warm)"),
+             ("OCS", 1e-5): ("o--", BLUE, 1.6, "OCS, 1e-5 (warm)"),
+             ("HIGHS", None): ("s-", PURP, 2.0, "HiGHS (IPM)"),
+             ("CUOPT", None): ("^-", GREEN, 2.0, "cuOpt"),
+             ("SCS", None): ("d-", RED, 2.0, "SCS")}
+    gurobi = [(1e3, 0.01), (1e4, 0.10), (1e5, 2.54), (1e6, 134.1)]     # their Table 1, Shape
+    devs = {r["device"] for r in last.values() if r["device"]}
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12.4, 5.3))
+    # left: their aggregated program (m = 5 shapes), time versus tasks
+    for (sv, tol), (mk, col, lw, lab) in style.items():
+        pts = series("shape", sv, tol)
+        if not pts:
+            continue
+        good = [(t, tm) for t, s, v, tm, ok, st in pts if ok and np.isfinite(tm)]
+        bad = [(t, tm, st) for t, s, v, tm, ok, st in pts if not ok]
+        if good:
+            ax.loglog(*zip(*good), mk, lw=lw, ms=6, color=col, label=lab)
+        for t, tm, st in bad:
+            ax.plot(t, tm if np.isfinite(tm) else 1e3, "x", ms=9, mew=2, color=col)
+            ax.annotate(_short(st), (t, tm if np.isfinite(tm) else 1e3),
+                        xytext=(4, 4), textcoords="offset points", fontsize=7, color=col)
+    ax.loglog(*zip(*gurobi), "o:", ms=8, mfc="none", color="k", lw=1.4,
+              label="Gurobi, as reported in their Table 1")
+    ax.set_xlabel("tasks $t$ (servers $t/40$, five shapes, $5t$ variables)")
+    ax.set_ylabel("solve time (s)")
+    ax.set_title("Their aggregated program, their sizes")
+    ax.grid(True, which="both", ls=":", alpha=.4); ax.legend(fontsize=8.2, loc="upper left")
+    top_ocs = [p for p in series("shape", "OCS", 1e-3) if p[0] == 1_000_000 and p[4]]
+    if top_ocs:
+        ax.annotate(f"{top_ocs[0][3]:.2g} s", (1e6, top_ocs[0][3]), xytext=(-40, -16),
+                    textcoords="offset points", fontsize=9, color=BLUE, fontweight="bold")
+        ax.annotate("134 s", (1e6, 134.1), xytext=(-34, 8), textcoords="offset points",
+                    fontsize=9, color="k")
+
+    # right: the per-server program they do not run, time versus variables
+    for (sv, tol), (mk, col, lw, lab) in style.items():
+        if tol == 1e-5:
+            continue
+        pts = series("server", sv, tol)
+        if not pts:
+            continue
+        good = [(v, tm) for t, s, v, tm, ok, st in pts if ok and np.isfinite(tm)]
+        bad = [(v, tm, st) for t, s, v, tm, ok, st in pts if not ok]
+        if good:
+            ax2.loglog(*zip(*good), mk, lw=lw, ms=6, color=col, label=lab)
+        for k, (v, tm, st) in enumerate(bad):
+            y = tm if (np.isfinite(tm) and tm > 0) else ax2.get_ylim()[1]
+            ax2.plot(v, y, "x", ms=9, mew=2, color=col)
+            ax2.annotate(_short(st), (v, y), xytext=(6, -12 - 11 * k),
+                         textcoords="offset points", fontsize=7, color=col)
+    srv = [p for p in series("server", "OCS", 1e-3) if p[4]]
+    if srv:
+        v, tm = srv[-1][2], srv[-1][3]
+        ax2.annotate(f"OCS: {_fmtn(v)} variables, {tm:.3g} s,\nno matrix formed",
+                     (v, tm), xytext=(-165, -34), textcoords="offset points",
+                     fontsize=8.5, color=BLUE, fontweight="bold",
+                     arrowprops=dict(arrowstyle="->", color=BLUE, lw=1.0))
+    ax2.set_xlabel("variables $s \\times t$ (individual servers, $t/40$ per task count)")
+    ax2.set_ylabel("solve time (s)")
+    ax2.set_title("Per-server pricing, the program they call $O(s^2 t)$")
+    ax2.grid(True, which="both", ls=":", alpha=.4); ax2.legend(fontsize=8.2, loc="upper left")
+
+    tidy_log_ticks(ax, ax2)
+    fig.tight_layout(rect=[0, 0.062, 1, 0.88])
+    headline(fig, "CvxCluster Stage-1 pricing LP (Nnorom, Boyd and Levis, 2026): "
+                  "$\\max\\ p^T A^T \\mathbf{1}$ s.t. $A^T\\mathbf{1} \\leq \\mathbf{1}$, $AT \\leq S$, $A \\geq 0$", 3,
+             "their program at their sizes, and the per-server program they aggregate away")
+    clean = lambda d: d.replace("NVIDIA GeForce ", "").replace("Intel(R) Core(TM) ", "").replace(" x", ", ")
+    gpus = sorted(clean(d) for d in devs if "GeForce" in d or "A100" in d)
+    cpus = sorted(clean(d) + " threads" for d in devs if "Core" in d or "EPYC" in d or "Xeon" in d)
+    tags = sorted({r["note"].split(";")[0].split()[0] for r in last.values() if r["note"].startswith("KEVIN") or r["note"].startswith("Mazeppa")})
+    dev = "; ".join(x for x in [", ".join(gpus), ", ".join(cpus), ", ".join(tags)] if x) or HW
+    import textwrap
+    note = (f"Every measured solver ran on the same machine ({dev}; float32 for OCS, float64 for the explicit "
+            "solvers). OCS: warm solve after a one-time compile, primal weight 10 on this family. HiGHS: interior point. "
+            "cuOpt: PDLP. SCS: direct, indirect at 1M tasks where the factorization fails. Gurobi times are the authors' own Table 1 numbers on their hardware, not "
+            "re-measured (no license here). Four priority levels 1, 2, 4, 8, five server shapes, r = 2, synthetic "
+            "demands at their 89 percent placement rate; their Azure-trace instances are not distributed.")
+    for i, line in enumerate(textwrap.wrap(note, 175)[:3]):
+        fig.text(0.5, 0.048 - 0.019 * i, line, ha="center", fontsize=7.3, color="dimgray")
+    fig.savefig(os.path.join(PLOTS, "J_cvxcluster_turf.png"), dpi=150); plt.close(fig)
+    print(f"   wrote J_cvxcluster_turf.png  (rows: {len(last)}, devices: {devs})")
+
+
+def K_billion_wedge():
+    """Regime 1 at the largest scale: the 3-D imaging model of
+    killer_3d_imaging.py (masked orthonormal FFT data term, isotropic 3-D TV,
+    nonnegativity) on ONE machine, OCS against every competitor that can take
+    the problem, from 16^3 voxels to 1000^3 = 10^9 voxels.  Data:
+    examples/billion_wedge.py on the same machine -> plots/billion_wedge_b200.csv."""
+    import csv as _csv
+    f = os.environ.get("WEDGE_CSV", os.path.join(PLOTS, "billion_wedge_b200.csv"))
+    if not os.path.exists(f):
+        print("   (skip K_billion_wedge: run billion_wedge.py collect first)"); return
+    rows = list(_csv.DictReader(open(f)))
+    def fl(v):
+        try: return float(v)
+        except (TypeError, ValueError): return float("nan")
+    def ok(r):
+        return str(r["status"]).lower().startswith(("solved", "optimal", "matched"))
+    by = {}
+    for r in rows:
+        by.setdefault(r["solver"], []).append(r)
+    for k in by:
+        by[k].sort(key=lambda r: fl(r["n"]))
+    fig, ax = plt.subplots(figsize=(8.6, 5.6))
+
+    # OCS: public package ladder plus the frozen prototype at 1000^3, one line.
+    ocs_rows = sorted(by.get("ocs", []) + by.get("ocs-prototype", []), key=lambda r: fl(r["n"]))
+    xs = [fl(r["n"]) for r in ocs_rows if ok(r)]; ys = [fl(r["solve_s"]) for r in ocs_rows if ok(r)]
+    ax.loglog(xs, ys, "o-", lw=2.6, ms=7, color=BLUE,
+              label="OCS, operator-native, GPU (certificate $\\leq 10^{-5}$)")
+    bx = [fl(r["n"]) for r in ocs_rows if not ok(r)]; byy = [fl(r["solve_s"]) for r in ocs_rows if not ok(r)]
+    if bx:
+        ax.loglog(bx, byy, "o", ms=8, mfc="white", mec=BLUE, mew=2, label="OCS, budget reached before $10^{-5}$")
+    big = [r for r in ocs_rows if fl(r["n"]) >= 1e9]
+    if big:
+        r = big[-1]; n, t = fl(r["n"]), fl(r["solve_s"])
+        ax.plot([n], [t], "*", ms=17, color=BLUE, mec="k", mew=0.8, zorder=5,
+                label="OCS prototype at $10^9$: budget-limited, residual beside the marker")
+        res = fl(r["residual"]); it = r.get("iterations", "")
+        ax.annotate(f"$10^9$ voxels, budget-limited:\n{t/3600:.1f} h, {int(fl(it)):,} iterations, one {r.get('device', 'GPU').replace('NVIDIA ', '').replace('GeForce ', '')}\n"
+                    f"certificate {res:.1e}, target $10^{{-5}}$ not reached"
+                    + ("\nfrom the measurement-derived start" if r.get("note", "").startswith("from the") else ""),
+                    (n, t), xytext=(n * 0.02, t * 0.035), fontsize=8.8, color=BLUE,
+                    arrowprops=dict(arrowstyle="->", color=BLUE, lw=1.2))
+
+    def competitor(key, marker, color, label, dx=1.8, dy=2.2):
+        rr = by.get(key, [])
+        good = [r for r in rr if ok(r)]
+        if good:
+            ax.loglog([fl(r["n"]) for r in good], [fl(r["solve_s"]) for r in good], marker + "--",
+                      lw=2.0, ms=7, color=color, label=label)
+        bad = [r for r in rr if not ok(r)]
+        if bad:
+            r = bad[0]; n = fl(r["n"])
+            yref = fl(good[-1]["solve_s"]) if good else 1.0
+            why = str(r["status"])
+            why = {"killed_out_of_memory": "killed: out of memory", "out_of_memory": "out of memory"}.get(why, why)
+            ax.plot([n], [yref], "x", ms=13, mew=3, color=RED)
+            ax.annotate(f"{label.split(',')[0]}: {why}\nat {int(n):,} voxels", (n, yref),
+                        xytext=(n * dx, yref * dy), color=RED, fontsize=8.2,
+                        arrowprops=dict(arrowstyle="->", color=RED, lw=1.1))
+        return max([fl(r["n"]) for r in rr], default=0.0)
+
+    reach = [competitor("scs", "s", PURP, "CVXPY/SCS, explicit operator, CPU", dx=0.06, dy=6.0),
+             competitor("cuopt", "^", ORANGE, "cuOpt PDLP, explicit operator, l1 TV, GPU", dx=3.0, dy=0.12)]
+
+    # ODL: measured matched-iteration time where it completed, projected from the
+    # measured per-iteration rate (hollow) where only the rate ladder ran.
+    ocs_it = {int(fl(r["n"])): fl(r["iterations"]) for r in ocs_rows if r.get("iterations")}
+    odl = by.get("odl", [])
+    meas_x, meas_y, proj_x, proj_y = [], [], [], []
+    for r in odl:
+        n = int(fl(r["n"])); it = fl(r["iterations"]); t = fl(r["solve_s"])
+        if n not in ocs_it or not (it > 0):
+            continue
+        if ok(r) and abs(it - ocs_it[n]) < 0.5:
+            meas_x.append(n); meas_y.append(t)
+        elif n not in meas_x:
+            proj_x.append(n); proj_y.append(t / it * ocs_it[n])
+    if meas_x:
+        ax.loglog(meas_x, meas_y, "D-.", lw=1.8, ms=6.5, color="#555555",
+                  label="ODL PDHG, its operators, CPU, at the OCS iteration count")
+    if proj_x:
+        ax.loglog(proj_x, proj_y, "D", ms=7, mfc="white", mec="#555555", mew=1.8,
+                  label="ODL, projected from its rate")
+    reach.append(max(meas_x + proj_x, default=0.0))
+
+    edge = max(reach)
+    allx = [fl(r["n"]) for r in ocs_rows]
+    if edge > 0 and allx:
+        right = max(allx) * 2.5
+        ax.axvspan(edge * 1.6, right, color=GREEN, alpha=0.08)
+        ylo, yhi = ax.get_ylim()
+        ax.text(np.sqrt(edge * 1.6 * right), ylo * 2000,
+                "no competitor result beyond this size on this machine",
+                ha="center", fontsize=9, color="#3a6b00")
+    ax.set_xlabel("voxels (variables); one 3-D TV cone per voxel")
+    ax.set_ylabel("time to $10^{-5}$ certificate, or to budget where marked (s)")
+    ax.grid(True, which="major", alpha=0.3); tidy_log_ticks(ax)
+    ax.legend(fontsize=7.2, loc="lower right")
+    dev = next((r.get("device", "") for r in ocs_rows if r.get("device")), "")
+    fig.text(0.5, 0.012,
+             f"One machine: {dev.replace('NVIDIA ', '')} GPU, competitors on the same host. SCS: eps_abs = eps_rel = 1e-5 on the SOCP "
+             "with the dense DFT rows.\ncuOpt: QP with l1 (anisotropic) TV, a different objective (a QP cannot take the isotropic cone), tol 1e-5. "
+             "ODL: its PDHG, numpy float64 FFT operators, no certificate.\nOCS: public package to $512^3$; the frozen prototype "
+             "(same operators, same model) at $1000^3$, certificate every 250 iterations.",
+             ha="center", fontsize=7.0, color="#444444")
+    fig.tight_layout(rect=[0, 0.075, 1, 0.9])
+    headline(fig, "3-D imaging: masked FFT + isotropic 3-D TV + nonnegativity, $16^3$ to $10^9$ voxels", 1,
+             "explicit solvers stop near $10^5$; OCS runs to $10^9$ (budget-limited)")
+    out = os.environ.get("WEDGE_OUT", "K_billion_wedge.png")
+    fig.savefig(os.path.join(PLOTS, out), dpi=150); plt.close(fig)
+    print(f"   {out}")
 
 
 def G_equilibration():
@@ -363,14 +913,22 @@ def G_equilibration():
         ax.axhline(1e-3, color="gray", ls=":", lw=1.2); ax.set_xlabel("imposed conditioning range  R"); ax.set_ylabel(f"residual after {BUDGET*100} iters (geo-mean, {TRIALS} seeds)")
         ax.set_title(name, fontsize=11); ax.grid(True, which="both", ls=":", alpha=.4); ax.legend(fontsize=9)
     fig.suptitle("Matrix-free equilibration (SMFE) limits sensitivity to row/column scaling on two operator families — using only matvec/rmatvec", fontsize=12)
-    fig.text(0.5, 0.012, "SMFE: 80 outer updates, 2 probes each, setup amortized across repeated solves; residual after 6000 PDHG iters, geo-mean over 5 seeds.  RTX 4090, float32.",
+    fig.text(0.5, 0.012, f"SMFE: 80 outer updates, 2 probes each, setup amortized across repeated solves; residual after 6000 PDHG iters, geo-mean over 5 seeds.  {HW}.",
              ha="center", fontsize=8, color="dimgray")
     fig.tight_layout(rect=[0, 0.04, 1, 1]); fig.savefig(os.path.join(PLOTS, "G_equilibration_ablation.png"), dpi=150); plt.close(fig)
     print("G: SMFE ablation written")
 
 
 if __name__ == "__main__":
-    for fn in [A_validation_battery, B_binpack_throughput, C_fft_wedge, D_mri_scale, E_grouped_prox, F_kronecker_storage, G_equilibration]:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("only", nargs="*", help="figure letters to (re)generate, e.g. F I")
+    sel = ap.parse_args().only
+    ALL = {"A": A_validation_battery, "B": B_binpack_throughput, "C": C_fft_wedge,
+           "D": D_mri_scale, "E": E_grouped_prox, "F": F_kronecker_wedge,
+           "G": G_equilibration, "H": H_ot_wedge, "I": I_rof_spdhg,
+           "J": J_cvxcluster_turf, "K": K_billion_wedge}
+    for fn in ([ALL[k.upper()] for k in sel] if sel else list(ALL.values())):
         try: fn()
         except Exception as e:
             import traceback; print(fn.__name__, "FAILED:", e); traceback.print_exc()

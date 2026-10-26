@@ -1,5 +1,13 @@
 """Validate OCS against SCS through the CVXPY harness.  Run: python tests/test_validate.py"""
 import numpy as np
+import pytest
+
+# Pinned to the RESIDUAL acceptance criterion: this file asserts about
+# the CVXPY validation harness against reference solvers.
+# OCS accepts on a certified objective gap by DEFAULT; see the
+# `residual_criterion` fixture in tests/conftest.py for why that is not
+# what these assertions are about. No assertion here is weakened.
+pytestmark = pytest.mark.usefixtures("residual_criterion")
 
 
 def test_lp():

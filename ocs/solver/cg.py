@@ -18,17 +18,20 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from .stopping import stable_norm, relative_ratio
+
 
 def make_cgls_solver(matvec, rmatvec, n, m, *, iters=200, rho=0.0, tol=1e-8):
     """Return a jitted, vmap-able solver for  min 1/2||K x - b||^2 + (rho/2)||x||^2.
 
     Returns solve(b, x0) -> (x, k, rel_resid) where rel_resid is the relative
-    normal-equation residual ||K^T(Kx-b) + rho x|| / ||K^T b||."""
+    normal-equation residual divided by max(||K^T b||, ||K^T(Kx-b)||,
+    rho*||x||), matching the free/smooth primal KKT normalization."""
     rho = float(rho)
 
     def solve(b, x0):
         Ktb = rmatvec(b)
-        nrm0 = jnp.linalg.norm(Ktb) + 1e-30
+        nrm0 = stable_norm(Ktb)
 
         # CGLS (Bjorck): r = b - Kx (range space), s = K^T r - rho x (normal eq residual)
         x = x0
@@ -43,7 +46,7 @@ def make_cgls_solver(matvec, rmatvec, n, m, *, iters=200, rho=0.0, tol=1e-8):
 
         def cond(st):
             _x, _r, _s, _p, g, k, _xb, gb = st
-            return (k < iters) & (jnp.sqrt(gb) / nrm0 > tol) & (g < 4.0 * gb + 1e-30)
+            return (k < iters) & (relative_ratio(jnp.sqrt(gb), nrm0) > tol) & (g < 4.0 * gb + 1e-30)
 
         def body(st):
             x, r, s, p, gamma, k, x_best, g_best = st
@@ -63,6 +66,15 @@ def make_cgls_solver(matvec, rmatvec, n, m, *, iters=200, rho=0.0, tol=1e-8):
 
         x, r, s, p, gamma, k, x_best, g_best = lax.while_loop(
             cond, body, (x, r, s, p, gamma, 0, x_best, g_best))
-        return x_best, k, jnp.sqrt(g_best) / nrm0
+        # A recurrence residual can drift in float32. Report the optimality
+        # residual of the point actually returned, using the operator again.
+        gradient = rmatvec(matvec(x_best) - b)
+        actual = gradient + rho * x_best
+        actual_norm = stable_norm(actual)
+        residual = relative_ratio(actual_norm, jnp.maximum(nrm0, jnp.maximum(
+            stable_norm(gradient), stable_norm(rho * x_best))))
+        valid = (jnp.all(jnp.isfinite(b)) & jnp.all(jnp.isfinite(x0))
+                 & jnp.all(jnp.isfinite(x_best)))
+        return x_best, k, jnp.where(valid, residual, jnp.inf)
 
     return jax.jit(jax.vmap(solve))

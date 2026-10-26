@@ -1,61 +1,58 @@
-"""OCS hello world: the two entry points.
+"""Small installed-package example: operator input and compile-once batches.
 
-  Entry 2 (trust):  sanity-check a SMALL problem against CVXPY (OCS vs SCS).
-  Entry 1 (scale):  solve the real thing, one fixed matrix-free K, many data,
-                    batched on the GPU, at a size where a formed matrix OOMs.
+This same self-contained code is in README.md; no repository data are needed.
 
-Run:  python examples/hello_world.py
+WHAT ``solved`` MEANS HERE.  It means a strict lower bound on the optimal
+objective value was certified at the returned point, and the gap between that
+bound and the objective value there met ``tol``.  It is a statement about the
+point you get back and the problem you asked about, so another solver can be
+held to the same test.  ``residual`` is still reported, and is still the
+relative prox-graph residual of this algorithm, but it no longer decides
+anything: it is not an objective-error bound and not a duality gap.
+
+Pass ``accuracy="residual"`` to ``solve_instance`` to accept on that residual
+instead, which is what earlier versions did by default.
 """
 import numpy as np
 import jax.numpy as jnp
 import ocs
 
-# ======================================================================
-# Entry point 2 -- sanity-check a small problem against CVXPY.
-# (Build any small cvxpy problem; the harness solves it with OCS and SCS and
-#  compares.  This is separate from the core solver -- just for trust.)
-# ======================================================================
-try:
-    import cvxpy as cp
-    from ocs.cvxpy_harness import validate_against_cvxpy
-    c0 = np.random.default_rng(0).normal(size=12)
-    xcp = cp.Variable(12)
-    small = cp.Problem(cp.Minimize(c0 @ xcp), [cp.norm(xcp, 2) <= 1])   # small SOCP
-    rep = validate_against_cvxpy(small)
-    print(f"[entry 2]  small SOCP:  OCS vs SCS objective rel-err = {rep['rel_err']:.1e}")
-except ImportError:
-    print("[entry 2]  (install cvxpy to run the sanity-check harness)")
+TOL = 1e-3
 
-# ======================================================================
-# Entry point 1 -- solve at scale:  min  lambda||x||_1 + 1/2||M F x - y||_2^2.
-# K = M F (subsampled orthonormal FFT) is never formed.  Compile the family ONCE,
-# then solve one instance -- and a whole batch with the same K, different y.
-# ======================================================================
-n = 4096
-K = ocs.FFTMask.random(n, ratio=0.25, seed=0)      # K : R^n -> R^{2m}, matrix-free
-x = ocs.Variable(n)
-y = ocs.Parameter("y")                             # the per-instance data (varies)
-
-problem = ocs.minimize([
-    ocs.l1(x, lam=1e-3),                           # g(x)
-    ocs.least_squares(K @ x - y),                  # f(Kx + l),  l = -y
+weights = jnp.array([1.0, 2.0, 3.0])
+K = ocs.LinearOperator.from_forward(lambda v: weights * v, n=3, m=3)
+x = ocs.Variable(3)
+b = ocs.Parameter("b")
+family = ocs.minimize([
+    ocs.nonneg(x),
+    ocs.least_squares(K @ x - b),
 ])
-compiled = problem.compile(block=100, max_blocks=80, tol=1e-3)
-print("[entry 1] ", compiled)
+compiled = family.compile(tol=TOL)
+sol = compiled.solve_instance({"b": jnp.array([-1.0, 2.0, 3.0])})
+print(sol.status, sol.accuracy_criterion, sol.objective_gap, sol.residual, sol.x)
+assert sol.status == "solved"
+# The criterion that awarded `solved`, and the quantity it tested.
+assert sol.accuracy_criterion == "objective_gap"
+assert sol.objective_gap is not None and sol.objective_gap <= TOL
+assert sol.objective_lower_bound <= sol.objective_primal_value
+np.testing.assert_allclose(sol.x, [0, 1, 1], atol=3e-3)
 
-# ground-truth sparse signal and its measurements
-rng = np.random.default_rng(1)
-def measure():
-    z = np.zeros(n); z[rng.choice(n, n // 50, replace=False)] = rng.normal(size=n // 50)
-    return np.asarray(K.matvec(jnp.asarray(z, jnp.float32)))
+# The same criterion on a batch: no row is accepted on a test the single
+# solve would have refused.
+results = compiled.solve_many_results({
+    "b": jnp.array([[-1.0, 2.0, 3.0], [2.0, -2.0, 6.0]])
+})
+for result, expected in zip(results, ([0, 1, 1], [2, 0, 2])):
+    print(result.status, result.accuracy_criterion, result.objective_gap,
+          result.iters, result.residual, result.x)
+    assert result.status == "solved"
+    assert result.accuracy_criterion == "objective_gap"
+    assert result.objective_gap is not None and result.objective_gap <= TOL
+    np.testing.assert_allclose(result.x, expected, atol=3e-3)
 
-# one instance
-sol = compiled.solve_instance({"y": measure()})
-print(f"[entry 1]  one instance:  iters~{sol.iters}  residual={sol.residual:.1e}  "
-      f"nnz(x)={int((np.abs(np.asarray(sol.x)) > 1e-4).sum())}")
-
-# MANY instances, same K, different y -- one batched GPU solve
-Y = jnp.asarray(np.stack([measure() for _ in range(16)]), jnp.float32)
-xb, yb, iters, res = compiled.solve_many({"y": Y})
-print(f"[entry 1]  batch of 16:   median residual={float(np.median(np.asarray(res))):.1e}  "
-      f"x batch shape={tuple(xb.shape)}")
+# The rejected criterion is still reachable, and says so about itself.
+legacy = compiled.solve_instance({"b": jnp.array([-1.0, 2.0, 3.0])},
+                                 accuracy="residual")
+print(legacy.status, legacy.accuracy_criterion, legacy.residual)
+assert legacy.accuracy_criterion == "fixed_point"
+assert legacy.objective_gap is None

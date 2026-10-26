@@ -37,10 +37,33 @@ class LinearOperator:
     def rmatvec(self, y):
         raise NotImplementedError
 
-    # K @ x  builds an affine expression (K x + 0); see model.expression
-    def __matmul__(self, var):
-        from ..model.expression import AffineExpr
-        return AffineExpr(op=self, var=var)
+    # Operator algebra.  `K @ other` dispatches on `other`:
+    #   * another operator  -> the composed operator  K other        (Compose)
+    #   * a Variable/AffineExpr -> the affine expression  K x (+ l)   (see model.expression)
+    def __matmul__(self, other):
+        if isinstance(other, LinearOperator):
+            from .common import Compose
+            return Compose(self, other)
+        from ..model.expression import apply_operator
+        return apply_operator(self, other)
+
+    def __add__(self, other):
+        # K + K'  -> the summed operator (same shape)
+        if isinstance(other, LinearOperator):
+            from .common import OpSum
+            return OpSum(self, other)
+        return NotImplemented
+
+    def __mul__(self, c):
+        # K * c  -> the scaled operator (c scalar)
+        from .common import Scale
+        return Scale(c, self)
+
+    __rmul__ = __mul__
+
+    def __neg__(self):
+        from .common import Scale
+        return Scale(-1.0, self)
 
     @classmethod
     def from_forward(cls, forward, n, m):

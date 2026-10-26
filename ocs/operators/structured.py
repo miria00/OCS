@@ -4,9 +4,14 @@
   MarginalOperator : X (N x M) |-> (row sums, col sums)   [optimal transport]
   Gradient2D       : image (H x W) |-> per-pixel (d_x, d_y) forward differences
                      [total variation / MRI / imaging]
+
+  Stored-factor matrix products request HIGHEST multiplication precision
+  locally, including batched calls. Array dtypes and global settings are
+  unchanged; this does not set precision inside custom operator callbacks.
 """
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from .base import LinearOperator
@@ -27,6 +32,13 @@ class MarginalOperator(LinearOperator):
         u, v = y[:self.N], y[self.N:]
         return (u[:, None] + v[None, :]).reshape(-1)      # X_ij <- u_i + v_j
 
+    # entries are 0/1, so |K|^{o2} = K: exact equilibration at matvec cost
+    def sq_matvec(self, x):
+        return self.matvec(x)
+
+    def sq_rmatvec(self, y):
+        return self.rmatvec(y)
+
 
 class Gradient3D(LinearOperator):
     """volume x (D x H x W), row-major vec.  K x = per-voxel (d_x, d_y, d_z)
@@ -38,19 +50,32 @@ class Gradient3D(LinearOperator):
 
     def matvec(self, x):
         v = x.reshape(self.D, self.H, self.W)
-        dx = jnp.zeros_like(v).at[:-1].set(v[1:] - v[:-1])
-        dy = jnp.zeros_like(v).at[:, :-1].set(v[:, 1:] - v[:, :-1])
-        dz = jnp.zeros_like(v).at[:, :, :-1].set(v[:, :, 1:] - v[:, :, :-1])
+        if self.shape[1] == 0:
+            return jnp.zeros_like(v).reshape(-1)
+        dx = jnp.pad(v[1:] - v[:-1], ((0, 1), (0, 0), (0, 0)))
+        dy = jnp.pad(v[:, 1:] - v[:, :-1], ((0, 0), (0, 1), (0, 0)))
+        dz = jnp.pad(v[:, :, 1:] - v[:, :, :-1], ((0, 0), (0, 0), (0, 1)))
         return jnp.stack([dx.reshape(-1), dy.reshape(-1), dz.reshape(-1)], 1).reshape(-1)
 
     def rmatvec(self, g):
-        g = g.reshape(-1, 3)
+        # The original scatter-add target was float32. Cast the edge values
+        # before accumulating to retain that dtype contract.
+        g = jnp.asarray(g, jnp.float32).reshape(-1, 3)
+        if self.shape[1] == 0:
+            return g.reshape(0)
         D, H, W = self.D, self.H, self.W
-        dx = g[:, 0].reshape(D, H, W); dy = g[:, 1].reshape(D, H, W); dz = g[:, 2].reshape(D, H, W)
-        a = jnp.zeros((D, H, W), jnp.float32)
-        a = a.at[1:].add(dx[:-1]).at[:-1].add(-dx[:-1])
-        a = a.at[:, 1:].add(dy[:, :-1]).at[:, :-1].add(-dy[:, :-1])
-        a = a.at[:, :, 1:].add(dz[:, :, :-1]).at[:, :, :-1].add(-dz[:, :, :-1])
+        dx = g[:, 0].reshape(D, H, W)[:-1]
+        dy = g[:, 1].reshape(D, H, W)[:, :-1]
+        dz = g[:, 2].reshape(D, H, W)[:, :, :-1]
+        # Only interior edges contribute. Padding the six neighbor terms
+        # exposes one stencil, instead of sequential scatter updates, and
+        # keeps the original accumulation order across coordinate directions.
+        a = jnp.pad(dx, ((1, 0), (0, 0), (0, 0)))
+        a = a - jnp.pad(dx, ((0, 1), (0, 0), (0, 0)))
+        a = a + jnp.pad(dy, ((0, 0), (1, 0), (0, 0)))
+        a = a - jnp.pad(dy, ((0, 0), (0, 1), (0, 0)))
+        a = a + jnp.pad(dz, ((0, 0), (0, 0), (1, 0)))
+        a = a - jnp.pad(dz, ((0, 0), (0, 0), (0, 1)))
         return a.reshape(-1)
 
 
@@ -66,10 +91,14 @@ class Kronecker(LinearOperator):
         super().__init__((self.m * self.n, self.p * self.q))
 
     def matvec(self, x):
-        return (self.A @ x.reshape(self.p, self.q) @ self.B.T).reshape(-1)
+        left = jnp.matmul(self.A, x.reshape(self.p, self.q),
+                          precision=jax.lax.Precision.HIGHEST)
+        return jnp.matmul(left, self.B.T, precision=jax.lax.Precision.HIGHEST).reshape(-1)
 
     def rmatvec(self, y):
-        return (self.A.T @ y.reshape(self.m, self.n) @ self.B).reshape(-1)
+        left = jnp.matmul(self.A.T, y.reshape(self.m, self.n),
+                          precision=jax.lax.Precision.HIGHEST)
+        return jnp.matmul(left, self.B, precision=jax.lax.Precision.HIGHEST).reshape(-1)
 
 
 class Sylvester(LinearOperator):
@@ -84,11 +113,15 @@ class Sylvester(LinearOperator):
 
     def matvec(self, x):
         X = x.reshape(self.p, self.q)
-        return (self.A @ X + X @ self.B).reshape(-1)
+        left = jnp.matmul(self.A, X, precision=jax.lax.Precision.HIGHEST)
+        right = jnp.matmul(X, self.B, precision=jax.lax.Precision.HIGHEST)
+        return (left + right).reshape(-1)
 
     def rmatvec(self, y):
         Y = y.reshape(self.p, self.q)
-        return (self.A.T @ Y + Y @ self.B.T).reshape(-1)
+        left = jnp.matmul(self.A.T, Y, precision=jax.lax.Precision.HIGHEST)
+        right = jnp.matmul(Y, self.B.T, precision=jax.lax.Precision.HIGHEST)
+        return (left + right).reshape(-1)
 
 
 class BinPack(LinearOperator):
@@ -103,12 +136,14 @@ class BinPack(LinearOperator):
 
     def matvec(self, x):
         X = x.reshape(self.I, self.B)
-        return jnp.concatenate([X.sum(axis=1), (self.Rmat @ X).reshape(-1)])
+        usage = jnp.matmul(self.Rmat, X, precision=jax.lax.Precision.HIGHEST)
+        return jnp.concatenate([X.sum(axis=1), usage.reshape(-1)])
 
     def rmatvec(self, y):
         u = y[:self.I]
         Wm = y[self.I:].reshape(self.R, self.B)
-        return (u[:, None] + self.Rmat.T @ Wm).reshape(-1)
+        usage = jnp.matmul(self.Rmat.T, Wm, precision=jax.lax.Precision.HIGHEST)
+        return (u[:, None] + usage).reshape(-1)
 
 
 class LeftMatMul(LinearOperator):
@@ -123,10 +158,12 @@ class LeftMatMul(LinearOperator):
         self.A, self.m, self.F, self.T = A, m, F, T
 
     def matvec(self, x):
-        return (self.A @ x.reshape(self.F, self.T)).reshape(-1)
+        return jnp.matmul(self.A, x.reshape(self.F, self.T),
+                          precision=jax.lax.Precision.HIGHEST).reshape(-1)
 
     def rmatvec(self, y):
-        return (self.A.T @ y.reshape(self.m, self.T)).reshape(-1)
+        return jnp.matmul(self.A.T, y.reshape(self.m, self.T),
+                          precision=jax.lax.Precision.HIGHEST).reshape(-1)
 
 
 class MultiCommodityFlow(LinearOperator):
@@ -142,10 +179,12 @@ class MultiCommodityFlow(LinearOperator):
         self.N, self.V, self.E, self.K = N, V, E, K
 
     def matvec(self, x):
-        return (self.N @ x.reshape(self.E, self.K)).reshape(-1)
+        return jnp.matmul(self.N, x.reshape(self.E, self.K),
+                          precision=jax.lax.Precision.HIGHEST).reshape(-1)
 
     def rmatvec(self, y):
-        return (self.N.T @ y.reshape(self.V, self.K)).reshape(-1)
+        return jnp.matmul(self.N.T, y.reshape(self.V, self.K),
+                          precision=jax.lax.Precision.HIGHEST).reshape(-1)
 
 
 class CommoditySum(LinearOperator):

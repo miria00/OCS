@@ -1,7 +1,10 @@
-# OCS reproducible environment. Known-good on Python 3.10.
+# Historical OCS experimental environment on Python 3.10.
+# Current RTX 5090 validation uses Python 3.12/JAX 0.11.1; see README.md.
+# Do not install these pins into that newer environment: they replace JAX.
+# Local RTX 4090 compiler failures on JAX 0.4.30 and 0.6.2 remain unresolved.
 #
-# OCS is a GPU solver. For a real (GPU) run, install JAX with CUDA FIRST, then
-# this file:
+# To reproduce the historical CUDA 12 environment, install GPU JAX FIRST,
+# then this file (this is not the current RTX 5090 setup):
 #     pip install "jax[cuda12]==0.4.30"
 #     pip install -r requirements.txt
 #
@@ -11,13 +14,13 @@
 
 # core solver
 jax==0.4.30
-numpy==1.26.2
+numpy==1.26.4
 
 # validation harness (compare OCS against reference solvers)
 scipy==1.15.3
-cvxpy==1.4.2
-scs==3.2.4
-clarabel==0.6.0
+cvxpy==1.6.5
+scs==3.3.1
+clarabel==0.11.1
 
 # figures and examples
 matplotlib==3.8.2

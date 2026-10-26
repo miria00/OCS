@@ -3,7 +3,8 @@ from .expression import (
     minimize, least_squares, sum_squares, l1, l2, nonneg, box, equality, group_l2,
     pinball, quantile, logistic, pwl, soc, psd, exp_cone, pow_cone,
 )
-from .compile import CompiledFamily, Solution, compile_family
+from .compile import (CompiledFamily, Solution, compile_family,
+                      OBJECTIVE_BOUND_STATUS, OBJECTIVE_BOUND_EPISTEMIC_LIMIT)
 
 __all__ = [
     "Variable", "Parameter", "AffineExpr",
@@ -11,4 +12,5 @@ __all__ = [
     "equality", "group_l2", "pinball", "quantile", "logistic", "pwl",
     "soc", "psd", "exp_cone", "pow_cone",
     "CompiledFamily", "Solution", "compile_family",
+    "OBJECTIVE_BOUND_STATUS", "OBJECTIVE_BOUND_EPISTEMIC_LIMIT",
 ]

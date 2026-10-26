@@ -15,7 +15,14 @@ PWL cost via the PiecewiseLinearConvex prox block.  Validated against CVXPY.
 
 Run:  python examples/killer_multicommodity.py
 """
-import numpy as np, jax.numpy as jnp, ocs
+import numpy as np
+import scipy.sparse as _sp
+# newer scipy dropped the deprecated .A attribute that older CVXPY still uses
+for _c in (_sp.csc_matrix, _sp.csr_matrix, _sp.coo_matrix):
+    if not hasattr(_c, "A"):
+        _c.A = property(lambda self: self.toarray())
+import jax.numpy as jnp
+import ocs
 
 # convex, increasing, piecewise-linear congestion cost phi(y) = max_j(s_j y + r_j),
 # through the origin with increasing marginal cost (slopes 0.5 -> 4).
@@ -27,7 +34,13 @@ for j in range(len(BREAKS)):
 INTER = np.array(INTER, np.float32)
 phi = lambda y: np.max(SLOPES[None, :] * np.asarray(y)[:, None] + INTER[None, :], axis=1)
 
-V, E, K, mu = 12, 40, 4, 1e-3
+# Paper scale: V=1000 nodes, E=2e4 arcs, K=1000 commodities -> 2e7 flow vars.
+# OCS_MCF_SMALL=1 gives the quick smoke size (and a CVXPY cross-check).
+import os as _os
+if _os.environ.get("OCS_MCF_SMALL"):
+    V, E, K, mu = 12, 40, 4, 1e-3
+else:
+    V, E, K, mu = 1000, 20000, 1000, 1e-3
 r = np.random.default_rng(1)
 N = np.zeros((V, E), np.float32)
 for e in range(E):
@@ -45,7 +58,7 @@ prob = ocs.minimize([
     ocs.equality(Ncons @ x - dp),                          # N f_k = d_k
     ocs.pwl(Csum @ x, SLOPES, INTER),                      # PWL congestion on arc totals
 ])
-comp = prob.compile(max_blocks=8000, tol=1e-5, adaptive_omega=False)
+comp = prob.compile(max_blocks=int(_os.environ.get('OCS_MCF_BLOCKS', 300)), tol=1e-4)
 print(comp, f"  ({E} arcs x {K} commodities = {E*K} flow vars)")
 
 sol = comp.solve_instance({"d": d})

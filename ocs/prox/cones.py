@@ -1,7 +1,10 @@
 """Cone projections (prox of cone indicators): second-order, PSD, exponential,
 power.  Each is coupled across its block, so its scaling class is "scalar".
 All are vmap-able (one cone per row), which is what the type-grouped dispatch
-relies on.  proj_exp / proj_pow are ported from the validated CORGI cones.
+relies on. Exponential and power program support remains experimental.
+
+The conjugate of a cone indicator is the indicator of its polar C^o = -C^*.
+Even for a self-dual cone, the conjugate domain is the NEGATIVE cone.
 """
 from __future__ import annotations
 
@@ -9,19 +12,91 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from .base import ProxBlock, SCALAR
+from .base import ProxBlock, SCALAR, _validate_step
+from ._exponential_cone import project_unit as _proj_exp_unit
+from ._power_cone import proj_pow
 
 _TOL = 1e-7
+
+#: Resolved-sign envelope of the PSD cone's evaluator membership test
+#: (``PSDCone.conj_in_domain_resolved``): lambda_max(sym y) must not exceed
+#: -PSD_RESOLVED_SIGN_C * k * eps32 * ||sym y||_2, the PSD analogue of the
+#: second-order cone's ``(2 n + 8) eps`` in ``_conservative_norm_leq``.  It is
+#: below the conservative projection's interior margin 8 k eps32 max|lambda|,
+#: so a once-adjusted proposal clears it.
+PSD_RESOLVED_SIGN_C = 2.0
 
 
 # =====================================================================
 # Second-order cone  { (s, z) : ||z||_2 <= s }   (s is the first entry)
 # =====================================================================
+def _conservative_norm_leq(z, radius, axis=0):
+    """Sufficient represented-data norm test, refusing unresolved roundoff.
+
+    Scale before squaring to avoid overflow/underflow. The margin covers the
+    scaled squares and reduction; it is subtracted from admissibility, never
+    added as feasibility slack. Axis-aligned cases and small integer square
+    sums are exactly decidable, including their boundary. No f64 vector or
+    global JAX precision change is introduced.
+    """
+    a = jnp.abs(z)
+    scale = jnp.max(a, axis=axis)
+    safe = jnp.where(scale > 0, scale, 1.)
+    normalized = z / jnp.expand_dims(safe, axis)
+    ss = jnp.sum(normalized * normalized, axis=axis)
+    rr = radius / safe
+    gamma = (2 * z.shape[axis] + 8) * jnp.finfo(z.dtype).eps
+    interior = ss * (1. + gamma) <= rr * rr * (1. - gamma)
+    axis_exact = (jnp.sum(z != 0, axis=axis) <= 1) & (scale <= radius)
+    integer = (jnp.all(z == jnp.round(z), axis=axis)
+               & (radius == jnp.round(radius)) & (scale <= 4096.)
+               & (radius <= 4096.))
+    small_z = jnp.clip(z, -4096., 4096.)
+    exact_ss = jnp.sum(small_z * small_z, axis=axis)
+    integer_exact = (integer & (z.shape[axis] * scale * scale <= 2**22)
+                     & (exact_ss <= radius * radius))
+    normal = jnp.asarray(True)
+    if z.dtype == jnp.float32:
+        # CUDA may flush subnormal arithmetic. Refuse that unresolved case
+        # using the stored bits, not an arithmetic comparison with zero.
+        bits = jax.lax.bitcast_convert_type(z, jnp.uint32) & jnp.uint32(0x7fffffff)
+        rb = jax.lax.bitcast_convert_type(radius, jnp.uint32) & jnp.uint32(0x7fffffff)
+        normal = (jnp.all((bits == 0) | (bits >= 0x00800000), axis=axis)
+                  & ((rb == 0) | (rb >= 0x00800000)))
+    return (jnp.all(jnp.isfinite(z), axis=axis) & jnp.isfinite(radius)
+            & normal & (radius >= 0) & (interior | axis_exact | integer_exact))
+
+
 class SecondOrderCone(ProxBlock):
     scaling_class = SCALAR
     eval_kind = "closed_form"
 
+    # f = indicator of the second-order cone K, which is self dual, so
+    # f^* = indicator of the polar -K.  The contract below is EXACT on the
+    # represented data: -y is in K when ||y[1:]|| <= -y[0], with no slack.
+    # ``value`` keeps its documented 1e-5 slack and is not consulted here.
+    is_indicator = True
+    bound_capable = True
+
     def prox(self, v, t):
+        t = _validate_step(v, t, self.scaling_class)
+        s, z = v[0], v[1:]
+        nz = jnp.linalg.norm(z)
+        inside = nz <= s
+        below = nz <= -s
+        scale = (nz + s) / (2.0 * nz + 1e-30)
+        proj_z = jnp.where(inside, z, jnp.where(below, 0.0 * z, scale * z))
+        proj_s = jnp.where(inside, s, jnp.where(below, 0.0, scale * nz))
+        return jnp.where(jnp.all(jnp.isfinite(t)),
+                         jnp.concatenate([jnp.reshape(proj_s, (1,)), proj_z]), jnp.nan)
+
+    def value(self, z):
+        return jnp.where(jnp.linalg.norm(z[1:]) <= z[0] + 1e-5, 0.0, jnp.inf)
+
+    def conj_value(self, y):                       # polar = negative self-dual cone
+        return jnp.where(self.conj_in_domain(y), 0., jnp.inf)
+
+    def _project(self, v):
         s, z = v[0], v[1:]
         nz = jnp.linalg.norm(z)
         inside = nz <= s
@@ -31,11 +106,32 @@ class SecondOrderCone(ProxBlock):
         proj_s = jnp.where(inside, s, jnp.where(below, 0.0, scale * nz))
         return jnp.concatenate([jnp.reshape(proj_s, (1,)), proj_z])
 
-    def value(self, z):
-        return jnp.where(jnp.linalg.norm(z[1:]) <= z[0] + 1e-5, 0.0, jnp.inf)
+    def conj_in_domain(self, y):
+        return _conservative_norm_leq(y[1:], -y[0])
 
-    def conj_value(self, y):                       # self-dual
-        return self.value(y)
+    def conj_domain_radius(self, y):
+        # dom f^* is a cone: every positive multiple of a member is a member,
+        # and no positive multiple of a non-member is one.
+        return jnp.where(self.conj_in_domain(y), jnp.inf, 0.0)
+
+    def conj_domain_project(self, y):
+        # Moreau: y = P_K(y) + P_{-K}(y), so the projection onto the polar is
+        # the residual of the Euclidean projection onto K.  That residual lies
+        # ON the boundary ||p[1:]|| = -p[0], where the exact membership test is
+        # decided by float32 rounding and differs between backends.  The
+        # proposal is therefore pulled a few ulps INSIDE the polar by shrinking
+        # the spatial part; it is a proposal, re-checked exactly by the caller.
+        p = y - self._project(y)
+        shrink = jnp.maximum(0., 1.0 - (4 * (y.size-1) + 16) * jnp.finfo(y.dtype).eps)
+        return jnp.concatenate([p[:1], p[1:] * shrink])
+
+    def conj_domain_project_exact(self, y):
+        # The Moreau residual itself, with no inside-pull.  A point already in
+        # the polar is returned unchanged (its projection onto K is zero), so
+        # repeating this projection does not move a valid candidate.  The
+        # inside-pull above is applied once by the caller, on the final
+        # candidate, under ``witness_contraction="once"``.
+        return y - self._project(y)
 
 
 # =====================================================================
@@ -44,25 +140,91 @@ class SecondOrderCone(ProxBlock):
 class PSDCone(ProxBlock):
     scaling_class = SCALAR
     eval_kind = "spectral"
+    is_indicator = True
+    bound_capable = True
 
     def __init__(self, k):
         self.k = int(k)
 
     def prox(self, v, t):
+        t = _validate_step(v, t, self.scaling_class)
         k = self.k
         M = v.reshape(k, k)
         M = 0.5 * (M + M.T)
-        w, U = jnp.linalg.eigh(M)
-        Mp = (U * jnp.maximum(w, 0.0)) @ U.T
-        return Mp.reshape(-1)
+        _, U = jnp.linalg.eigh(M)
+        # Repair eigenpair roundoff before clipping. Small primal steps can
+        # amplify GPU eigenvector norm and eigenvalue errors during PDHG.
+        U = U / jnp.sqrt(jnp.sum(U * U, axis=0))
+        MU = jnp.matmul(M, U, precision=jax.lax.Precision.HIGHEST)
+        w = jnp.sum(U * MU, axis=0)
+        # Reduced-precision GPU products make this projection non-idempotent
+        # near the requested solver tolerance. Preserve float32 accuracy here.
+        Mp = jnp.matmul(U * jnp.maximum(w, 0.0), U.T,
+                        precision=jax.lax.Precision.HIGHEST)
+        return jnp.where(jnp.all(jnp.isfinite(t)), Mp.reshape(-1), jnp.nan)
 
     def value(self, z):
         M = z.reshape(self.k, self.k)
         w = jnp.linalg.eigvalsh(0.5 * (M + M.T))
         return jnp.where(jnp.min(w) >= -1e-4, 0.0, jnp.inf)
 
-    def conj_value(self, y):                       # self-dual
-        return self.value(y)
+    def conj_value(self, y):                       # polar = negative self-dual cone
+        return jnp.where(self.conj_in_domain(y), 0.0, jnp.inf)
+
+    def conj_in_domain(self, y):
+        # On the full matrix carrier, skew components annihilate every
+        # symmetric primal matrix. Only sym(y) must be negative semidefinite.
+        # This spectral test has no feasibility slack; it is still a numerical
+        # evaluation, not a rigorous real-arithmetic eigenvalue enclosure.
+        M = y.reshape(self.k, self.k)
+        return jnp.all(jnp.isfinite(y)) & (jnp.max(jnp.linalg.eigvalsh(0.5 * (M + M.T))) <= 0)
+
+    #: The objective-bound evaluator decides this block's membership with
+    #: ``conj_in_domain_resolved`` (see ``ocs.model.compile``).
+    resolved_sign_domain = True
+
+    def conj_in_domain_resolved(self, y):
+        # Membership with a RESOLVED sign, for the objective-bound evaluator:
+        # stricter than ``conj_in_domain``, never looser.  y is admitted only if
+        # ``conj_in_domain`` admits it AND, on the represented float32 values,
+        #     lambda_max(sym y) <= -PSD_RESOLVED_SIGN_C * k * eps32 * ||sym y||_2
+        # with sym y and its eigenvalues computed in scoped float64 (sym of
+        # float32 data is exact in float64).  A sign inside that envelope is
+        # unresolved at the float32 scale on which the data and the coupling
+        # were formed, so it is NOT admitted: there is no small-negative-
+        # eigenvalue allowance in either direction.  The zero matrix (||sym y||
+        # = 0) is admitted.  The barrier keeps XLA from folding the round trip
+        # float32 -> float64 into a re-derivation of y at higher precision
+        # (the 0.3.5 piecewise-linear pattern), so the tested numbers are
+        # exactly the represented ones.  Still a numerical evaluation on
+        # represented data, not a real-arithmetic enclosure of an arbitrary
+        # float32 adjoint.
+        k = self.k
+        gamma = PSD_RESOLVED_SIGN_C * k * float(jnp.finfo(jnp.float32).eps)
+        admitted = self.conj_in_domain(y)
+        with jax.enable_x64():
+            y32 = y.astype(jnp.float32)
+            y64 = jax.lax.optimization_barrier(y32).astype(jnp.float64)
+            M = y64.reshape(k, k)
+            w = jnp.linalg.eigvalsh(0.5 * (M + M.T))
+            resolved = jnp.all(jnp.isfinite(w)) & (w[-1] <= -gamma * jnp.max(jnp.abs(w)))
+        return admitted & resolved
+
+    def conj_domain_radius(self, y):
+        return jnp.where(self.conj_in_domain(y), jnp.inf, 0.0)
+
+    def conj_domain_project(self, y):
+        M = y.reshape(self.k, self.k)
+        sym = 0.5 * (M + M.T)
+        w, U = jnp.linalg.eigh(sym)
+        negative = jnp.matmul(U * jnp.minimum(w, 0.0), U.T,
+                              precision=jax.lax.Precision.HIGHEST)
+        negative = 0.5 * (negative + negative.T)
+        # An interior proposal avoids accepting eigenvector reconstruction
+        # noise as a domain guarantee; the consumer rechecks membership.
+        margin = 8 * self.k * jnp.finfo(y.dtype).eps * jnp.max(jnp.abs(w))
+        negative -= margin * jnp.eye(self.k, dtype=y.dtype)
+        return (negative + 0.5 * (M - M.T)).reshape(-1)
 
     def group_key(self):
         return ("PSDCone", self.k)
@@ -79,40 +241,26 @@ def _in_exp(r, s, t, tol=_TOL):
 
 
 def proj_exp(v):
+    """Project in normalized cone units, then restore the input magnitude.
+
+    Cone projection is positively homogeneous. Normalizing makes the inner
+    root find's numerical safeguards relative and prevents a tiny input from
+    being declared feasible solely by its absolute magnitude.
+    """
     v = jnp.asarray(v, jnp.float32)
-    r, s, t = v[0], v[1], v[2]
+    scale = jnp.max(jnp.abs(v))
+    unit = v / jnp.where(scale > 0, scale, 1.0)
+    projected = scale * _proj_exp_unit(unit)
+    return jnp.where(scale == 0, jnp.zeros_like(v), projected)
 
-    def boundary_point(u):
-        eu = jnp.exp(u)
-        a = r * u + s + t * eu
-        b = u * u + 1.0 + jnp.exp(2.0 * u)
-        y = jnp.maximum(a / b, 0.0)
-        return jnp.stack([y * u, y, y * eu])
 
-    def H(u):
-        eu = jnp.exp(u); e2 = jnp.exp(2.0 * u)
-        a = r * u + s + t * eu; b = u * u + 1.0 + e2
-        ap = r + t * eu; bp = 2.0 * u + 2.0 * e2
-        return 2.0 * ap * b - a * bp
-
-    U, ng = 20.0, 192
-    us = jnp.linspace(-U, U, ng)
-    P = jax.vmap(boundary_point)(us)
-    u0 = us[jnp.argmin(jnp.sum((P - v) ** 2, axis=1))]
-
-    dH = jax.grad(H)
-    def body(st):
-        u, it = st
-        return jnp.clip(u - H(u) / (dH(u) + 1e-30), -U, U), it + 1
-    u_ref, _ = lax.while_loop(lambda st: st[1] < 25, body, (u0, 0))
-
-    A = boundary_point(u_ref)
-    B = jnp.array([jnp.minimum(r, 0.0), 0.0, jnp.maximum(t, 0.0)])
-    O = jnp.zeros(3)
-    cands = jnp.stack([A, B, O])
-    feas = jax.vmap(lambda p: _in_exp(p[0], p[1], p[2]))(cands)
-    dd = jnp.where(feas, jnp.sum((cands - v) ** 2, axis=1), jnp.inf)
-    return jnp.where(_in_exp(r, s, t), v, cands[jnp.argmin(dd)])
+def _in_exp_dual(u, s, w, tol=_TOL):
+    # dual of {(r,s,t): s>0, t >= s e^{r/s}} is
+    #   {(u,v,w): u<0, -u e^{v/u} <= e w} U {(0,v,w): v>=0, w>=0}
+    u_safe = jnp.minimum(u, -1e-30)
+    c1 = (u < 0) & (-u * jnp.exp(s / u_safe) <= jnp.e * w + tol * (1.0 + jnp.abs(w)))
+    c2 = (jnp.abs(u) <= tol) & (s >= -tol) & (w >= -tol)
+    return c1 | c2
 
 
 class ExpCone(ProxBlock):
@@ -120,10 +268,14 @@ class ExpCone(ProxBlock):
     eval_kind = "newton"
 
     def prox(self, v, t):
-        return proj_exp(v)
+        t = _validate_step(v, t, self.scaling_class)
+        return jnp.where(jnp.all(jnp.isfinite(t)), proj_exp(v), jnp.nan)
 
-    def value(self, z):                            # indicator; dual cone omitted
+    def value(self, z):                            # primal cone indicator
         return jnp.where(_in_exp(z[0], z[1], z[2]), 0.0, jnp.inf)
+
+    def conj_value(self, y):                       # indicator conjugate is the polar cone
+        return jnp.where(_in_exp_dual(-y[0], -y[1], -y[2]), 0.0, jnp.inf)
 
 
 # =====================================================================
@@ -135,55 +287,168 @@ def _in_pow(x, y, z, a, tol=_TOL):
     return (x >= -tol) & (y >= -tol) & (lhs - jnp.abs(z) >= -tol * (1.0 + jnp.abs(z)))
 
 
-def proj_pow(v, alpha=0.5):
-    v = jnp.asarray(v, jnp.float32)
-    x0, y0, z0 = v[0], v[1], v[2]
-    a = jnp.asarray(alpha, jnp.float32)
-    az = jnp.abs(z0); sz = jnp.sign(z0)
-
-    def p_of(x, y):
-        return (jnp.maximum(x, 1e-30) ** a) * (jnp.maximum(y, 1e-30) ** (1.0 - a))
-
-    def grads_hess(x, y):
-        p = p_of(x, y)
-        px = a * p / x; py = (1.0 - a) * p / y; res = p - az
-        gx = (x - x0) + res * px; gy = (y - y0) + res * py
-        pxx = a * (a - 1.0) * p / (x * x)
-        pyy = (1.0 - a) * (-a) * p / (y * y)
-        pxy = a * (1.0 - a) * p / (x * y)
-        return gx, gy, 1.0 + px * px + res * pxx, 1.0 + py * py + res * pyy, px * py + res * pxy
-
-    def body(st):
-        x, y, it = st
-        gx, gy, hxx, hyy, hxy = grads_hess(x, y)
-        det = hxx * hyy - hxy * hxy
-        det = jnp.where(jnp.abs(det) < 1e-30, 1e-30, det)
-        x_new = jnp.maximum(x - (hyy * gx - hxy * gy) / det, 1e-12)
-        y_new = jnp.maximum(y - (hxx * gy - hxy * gx) / det, 1e-12)
-        return x_new, y_new, it + 1
-
-    x_s, y_s, _ = lax.while_loop(lambda st: st[2] < 40,
-                                 body, (jnp.maximum(x0, 1e-2), jnp.maximum(y0, 1e-2), 0))
-    A = jnp.stack([x_s, y_s, sz * p_of(x_s, y_s)])
-    O = jnp.zeros(3)
-    cands = jnp.stack([A, O])
-    feas = jax.vmap(lambda p: _in_pow(p[0], p[1], p[2], a))(cands)
-    dd = jnp.where(feas, jnp.sum((cands - v) ** 2, axis=1), jnp.inf)
-    return jnp.where(_in_pow(x0, y0, z0, a), v, cands[jnp.argmin(dd)])
+def _in_pow_dual(u, v, w, a, tol=_TOL):
+    # dual of {(x,y,z): x,y>=0, x^a y^{1-a} >= |z|} is
+    #   {(u,v,w): u,v>=0, (u/a)^a (v/(1-a))^{1-a} >= |w|}
+    us = jnp.maximum(u, 0.0); vs = jnp.maximum(v, 0.0)
+    lhs = ((us / a) ** a) * ((vs / (1.0 - a)) ** (1.0 - a))
+    return (u >= -tol) & (v >= -tol) & (lhs - jnp.abs(w) >= -tol * (1.0 + jnp.abs(w)))
 
 
 class PowerCone(ProxBlock):
     scaling_class = SCALAR
-    eval_kind = "newton"
+    eval_kind = "bisection"
 
     def __init__(self, alpha=0.5):
         self.alpha = float(alpha)
 
     def prox(self, v, t):
-        return proj_pow(v, self.alpha)
+        t = _validate_step(v, t, self.scaling_class)
+        return jnp.where(jnp.all(jnp.isfinite(t)), proj_pow(v, self.alpha), jnp.nan)
 
-    def value(self, z):                            # indicator; dual cone omitted
+    def value(self, z):                            # primal cone indicator
         return jnp.where(_in_pow(z[0], z[1], z[2], self.alpha), 0.0, jnp.inf)
+
+    def conj_value(self, y):                       # indicator conjugate is the polar cone
+        return jnp.where(_in_pow_dual(-y[0], -y[1], -y[2], self.alpha), 0.0, jnp.inf)
 
     def group_key(self):
         return ("PowerCone", self.alpha)
+
+
+# =====================================================================
+# Batched cones in CVXPY's stacked layout (for the cvxpy_mf bridge)
+# =====================================================================
+class PowerConeBatch(ProxBlock):
+    """q power cones stacked CVXPY-style: u = [x (q); y (q); z (q)],
+    triple j = (x_j, y_j, z_j) with x_j^a y_j^(1-a) >= |z_j|.
+    Projection vmapped over triples (one bracketed scalar solve per triple)."""
+    scaling_class = SCALAR
+    eval_kind = "bisection"
+
+    def __init__(self, q, alpha=0.5):
+        self.q = int(q); self.alpha = float(alpha)
+
+    def prox(self, v, t):
+        t = _validate_step(v, t, self.scaling_class)
+        q = self.q
+        triples = jnp.stack([v[:q], v[q:2 * q], v[2 * q:]], axis=1)   # (q, 3)
+        proj = jax.vmap(lambda w: proj_pow(w, self.alpha))(triples)
+        return jnp.where(jnp.all(jnp.isfinite(t)),
+                         jnp.concatenate([proj[:, 0], proj[:, 1], proj[:, 2]]), jnp.nan)
+
+    def value(self, z):
+        q = self.q
+        ok = jnp.all(_in_pow(z[:q], z[q:2 * q], z[2 * q:], self.alpha))
+        return jnp.where(ok, 0.0, jnp.inf)
+
+    def conj_value(self, y):
+        q = self.q
+        ok = jnp.all(_in_pow_dual(-y[:q], -y[q:2 * q], -y[2 * q:], self.alpha))
+        return jnp.where(ok, 0.0, jnp.inf)
+
+    def group_key(self):
+        return ("PowerConeBatch", self.q, self.alpha)
+
+
+class SOCBatch(ProxBlock):
+    """q second-order cones stacked CVXPY-style: u = [t (q); vec_F(Z) (d*q)],
+    cone j = (t_j, Z[:, j]).  One vectorized projection over all q cones."""
+    scaling_class = SCALAR
+    eval_kind = "closed_form"
+    # Same exact polar contract as SecondOrderCone, per cone: -y_j in K_j when
+    # ||Z_j|| <= -t_j for every j, no slack.  ``value`` keeps its 1e-5 slack.
+    is_indicator = True
+    bound_capable = True
+
+    def __init__(self, q, d):
+        self.q, self.d = int(q), int(d)
+
+    def prox(self, v, t):
+        t = _validate_step(v, t, self.scaling_class)
+        q, d = self.q, self.d
+        s = v[:q]
+        Z = jnp.reshape(v[q:], (d, q), order="F")
+        nz = jnp.linalg.norm(Z, axis=0)
+        inside = nz <= s
+        below = nz <= -s
+        scale = (nz + s) / (2.0 * nz + 1e-30)
+        col = jnp.where(inside, 1.0, jnp.where(below, 0.0, scale))
+        proj_s = jnp.where(inside, s, jnp.where(below, 0.0, scale * nz))
+        proj_Z = Z * col[None, :]
+        return jnp.where(jnp.all(jnp.isfinite(t)),
+                         jnp.concatenate([proj_s, jnp.reshape(proj_Z, (-1,), order="F")]), jnp.nan)
+
+    def value(self, z):
+        q, d = self.q, self.d
+        nz = jnp.linalg.norm(jnp.reshape(z[q:], (d, q), order="F"), axis=0)
+        ok = jnp.max(nz - z[:q]) <= 1e-5
+        return jnp.where(ok, 0.0, jnp.inf)
+
+    def conj_value(self, y):                       # polar = negative self-dual cone
+        return jnp.where(self.conj_in_domain(y), 0., jnp.inf)
+
+    def _project(self, v):
+        q, d = self.q, self.d
+        s = v[:q]
+        Z = jnp.reshape(v[q:], (d, q), order="F")
+        nz = jnp.linalg.norm(Z, axis=0)
+        inside = nz <= s
+        below = nz <= -s
+        scale = (nz + s) / (2.0 * nz + 1e-30)
+        col = jnp.where(inside, 1.0, jnp.where(below, 0.0, scale))
+        proj_s = jnp.where(inside, s, jnp.where(below, 0.0, scale * nz))
+        return jnp.concatenate([proj_s, jnp.reshape(Z * col[None, :], (-1,), order="F")])
+
+    def conj_in_domain(self, y):
+        q, d = self.q, self.d
+        z = jnp.reshape(y[q:], (d, q), order="F")
+        return jnp.all(_conservative_norm_leq(z, -y[:q], axis=0))
+
+    def conj_domain_radius(self, y):
+        return jnp.where(self.conj_in_domain(y), jnp.inf, 0.0)
+
+    def conj_domain_project(self, y):
+        # The same boundary argument as SecondOrderCone: pull each cone a few
+        # ulps inside the polar so the exact re-check is not a rounding coin flip.
+        p = y - self._project(y)
+        shrink = jnp.maximum(0., 1.0 - (4 * self.d + 16) * jnp.finfo(y.dtype).eps)
+        return jnp.concatenate([p[:self.q], p[self.q:] * shrink])
+
+    def conj_domain_project_exact(self, y):
+        # As for SecondOrderCone: the Moreau residual with no inside-pull.
+        return y - self._project(y)
+
+    def group_key(self):
+        return ("SOCBatch", self.q, self.d)
+
+
+class ExpConeBatch(ProxBlock):
+    """q exponential cones stacked CVXPY-style: u = [x (q); y (q); z (q)],
+    triple j = (x_j, y_j, z_j).  Projection vmapped over triples."""
+    scaling_class = SCALAR
+    eval_kind = "newton"
+
+    def __init__(self, q):
+        self.q = int(q)
+
+    def prox(self, v, t):
+        t = _validate_step(v, t, self.scaling_class)
+        q = self.q
+        triples = jnp.stack([v[:q], v[q:2 * q], v[2 * q:]], axis=1)   # (q, 3)
+        proj = jax.vmap(proj_exp)(triples)
+        return jnp.where(jnp.all(jnp.isfinite(t)),
+                         jnp.concatenate([proj[:, 0], proj[:, 1], proj[:, 2]]), jnp.nan)
+
+    def value(self, z):
+        q = self.q
+        ok = jnp.all(_in_exp(z[:q], z[q:2 * q], z[2 * q:]))
+        return jnp.where(ok, 0.0, jnp.inf)
+
+    def conj_value(self, y):
+        q = self.q
+        ok = jnp.all(_in_exp_dual(-y[:q], -y[q:2 * q], -y[2 * q:]))
+        return jnp.where(ok, 0.0, jnp.inf)
+
+    def group_key(self):
+        return ("ExpConeBatch", self.q)

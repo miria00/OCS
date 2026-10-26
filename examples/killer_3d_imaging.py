@@ -8,8 +8,15 @@ one grouped kernel; x>=0 is a nonnegativity (density) constraint.
 
 Run:  python examples/killer_3d_imaging.py
 """
+import os, sys
 import numpy as np, jax.numpy as jnp, ocs
-D = H = W = 40                                   # 64,000-voxel volume
+# Paper scale: 256^3 = 16.8M voxels / 16.8M 3-D TV cones (OCS_3D_L to override).
+# NOTE the budget: in float32 this problem does NOT keep improving if run long
+# (see the paper); the useful iterate is an early one, which is why max_blocks
+# is small here.  L=40 is the quick smoke size.
+L = int(os.environ.get("OCS_3D_L", 384))
+BLOCKS = int(os.environ.get("OCS_3D_BLOCKS", 400))
+D = H = W = L
 n = D * H * W
 vol = np.zeros((D, H, W), np.float32)
 vol[8:28, 10:34, 12:30] = 1.0; vol[20:36, 6:20, 18:38] += 0.5     # two blobs
@@ -21,7 +28,7 @@ x = ocs.Variable(n); yp = ocs.Parameter("y")
 prob = ocs.minimize([ocs.nonneg(x),                                  # density >= 0
                      ocs.least_squares(F @ x - yp),
                      ocs.group_l2(G3 @ x, lam=0.02, group_size=3)])   # 3-D TV cones
-comp = prob.compile(max_blocks=1500, tol=1e-4)
+comp = prob.compile(max_blocks=BLOCKS, tol=1e-3)
 print(comp, f"  (volume {D}x{H}x{W} = {n:,} voxels, {n:,} 3-D TV cones)")
 sol = comp.solve_instance({"y": jnp.asarray(y)})
 rec = np.asarray(sol.x); zf = np.maximum(np.asarray(F.rmatvec(jnp.asarray(y))), 0)

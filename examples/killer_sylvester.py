@@ -18,8 +18,15 @@ from scipy.linalg import solve_sylvester
 
 p, q = 60, 50
 rng = np.random.default_rng(0)
-A = rng.normal(size=(p, p)).astype(np.float32) * 0.5 + 5 * np.eye(p, dtype=np.float32)
-B = rng.normal(size=(q, q)).astype(np.float32) * 0.5 + 5 * np.eye(q, dtype=np.float32)
+# The shift must dominate the Gaussian's spectral radius 0.5*sqrt(p), or the
+# eigenvalue sums lam_i(A) + lam_j(B) approach zero and the operator becomes
+# ill conditioned: a fixed 5I gives kappa_2 = 4.5e3 at p = 512 and 7 percent
+# forward error despite a 1e-6 residual. Scaling the shift keeps kappa_2 < 8 at
+# every size, and the same residual then gives 1e-5 forward error.
+shift_p, shift_q = 0.5 * np.sqrt(p) + 5, 0.5 * np.sqrt(q) + 5
+A = rng.normal(size=(p, p)).astype(np.float32) * 0.5 + shift_p * np.eye(p, dtype=np.float32)
+B = rng.normal(size=(q, q)).astype(np.float32) * 0.5 + shift_q * np.eye(q, dtype=np.float32)
+
 Xt = rng.normal(size=(p, q)).astype(np.float32)
 C = (A @ Xt + Xt @ B).astype(np.float32)
 Xr = solve_sylvester(A.astype(np.float64), B.astype(np.float64), C.astype(np.float64))
