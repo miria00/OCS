@@ -11,10 +11,14 @@ each `f_i` is a proximal block evaluated on the GPU. The constraint matrix is
 never formed. A problem family is compiled once and then solved for many
 instances with changing data, one at a time or as a batch.
 
-This is version **0.3.7**. It validates recovered bounds on the actual returned
-witness, integrates bounded opt-in refinement, and reduces large-array storage
-and compilation overhead. It retains the objective-gap stall fix, stable opt-in
-SOC/PSD metric construction, and prepared quadratic transport solver.
+This is version **0.3.8**. It decides second-order cone and PSD dual-domain
+membership, and PSD primal feasibility, in scoped float64 on the represented
+float32 values, and its PSD cone never passes an exactly zero matrix to the
+eigensolver (see `CHANGES.md`). It retains everything in 0.3.7: recovered
+bounds validated on the actual returned witness, bounded opt-in refinement,
+reduced large-array storage and compilation overhead, the objective-gap stall
+fix, stable opt-in SOC/PSD metric construction, and the prepared quadratic
+transport solver.
 Before publication, install the qualified wheel file directly; the index
 commands below apply once that version is published.
 
@@ -42,7 +46,7 @@ GPU, the qualified procedure:
 python3.12 -m venv ocs-env
 source ocs-env/bin/activate
 python -m pip install "jax[cuda12]==0.11.1"
-python -m pip install "ocsolver==0.3.7"
+python -m pip install "ocsolver==0.3.8"
 export XLA_FLAGS="--xla_gpu_enable_triton_gemm=false --xla_gpu_force_compilation_parallelism=1"
 python -c "import jax; print(jax.devices())"     # expect a CudaDevice
 ```
@@ -50,7 +54,7 @@ python -c "import jax; print(jax.devices())"     # expect a CudaDevice
 Pin the version to reproduce the qualified installation. CPU only, for small problems:
 
 ```bash
-python -m pip install "jax==0.11.1" "ocsolver==0.3.7"
+python -m pip install "jax==0.11.1" "ocsolver==0.3.8"
 ```
 
 Confirm the installed identity before reporting a result:
@@ -59,7 +63,7 @@ Confirm the installed identity before reporting a result:
 python -c "import ocs, importlib.metadata as m; print(ocs.__version__, m.version('ocsolver'))"
 ```
 
-Both must print `0.3.7`.
+Both must print `0.3.8`.
 
 ## First solve
 
@@ -246,7 +250,7 @@ yourself.
   used explicitly and never by the solver: it materializes the stuffed matrix
   to compare small problems against a reference solver and is for bounded
   validation only. Both require the `validation` extra:
-  `pip install "ocsolver[validation]==0.3.7"`.
+  `pip install "ocsolver[validation]==0.3.8"`.
 - Research-only paths (the online and `diagpp`
   equilibration variants, `ocs.experimental`) are reachable by name and change
   nothing unless asked for.
@@ -256,7 +260,7 @@ yourself.
 ## Source and reporting
 
 The source tree, tests and examples ship in the source distribution
-(`ocsolver-0.3.7.tar.gz`). Run the tests from an installed package with
+(`ocsolver-0.3.8.tar.gz`). Run the tests from an installed package with
 `python -m pytest tests` from the unpacked source distribution. Report a
 problem with the output of the identity check above, the `Solution` fields
 `status`, `accuracy_criterion`, `accuracy_detail` and `gap_history`, and a
