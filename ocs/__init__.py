@@ -25,7 +25,7 @@ from .model import (
     OBJECTIVE_BOUND_STATUS, OBJECTIVE_BOUND_EPISTEMIC_LIMIT,
 )
 
-__version__ = "0.3.7"
+__version__ = "0.3.8"
 
 __all__ = [
     # operators

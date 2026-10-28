@@ -64,3 +64,45 @@ def test_rounded_norm_cannot_accept_an_outside_polar_witness():
     p=SecondOrderCone().conj_domain_project(y)
     assert bool(SecondOrderCone().conj_in_domain(p))
     assert np.linalg.norm(np.asarray(p[1:],dtype=np.float64)) <= -float(p[0])
+
+
+def _norm64(v):
+    return float(np.linalg.norm(np.asarray(v, dtype=np.float64)))
+
+
+@pytest.mark.parametrize("n", [512, 4096])
+def test_large_cone_membership_is_decided_in_float64(n):
+    # Since 0.3.8: a point inside the polar by 1e-5 relative is beyond the
+    # float32 envelope (2 n + 8) eps32 but is admitted by the float64 test;
+    # the largest float32 radius below the exact norm is still refused.
+    from ocs.prox.cones import _conservative_norm_leq
+    rng = np.random.default_rng(n)
+    z = rng.normal(size=n).astype(np.float32)
+    nz = _norm64(z)
+    r_in = np.float32(nz * (1 + 1e-5))
+    y_in = jnp.asarray(np.concatenate([[-r_in], z]).astype(np.float32))
+    assert not bool(_conservative_norm_leq(y_in[1:], -y_in[0]))
+    assert bool(SecondOrderCone().conj_in_domain(y_in))
+    r_out = np.float32(nz)
+    while float(r_out) >= nz:
+        r_out = np.nextafter(r_out, np.float32(0.0))
+    y_out = jnp.asarray(np.concatenate([[-r_out], z]).astype(np.float32))
+    assert not bool(SecondOrderCone().conj_in_domain(y_out))
+
+
+@pytest.mark.parametrize("n", [512, 4096])
+def test_large_cone_projection_pull_does_not_grow_with_dimension(n):
+    # The proposal is in the polar and sits at most a few dozen float32 ulps
+    # inside the boundary, not (4 n + 16) eps32 as through 0.3.7.
+    blk = SecondOrderCone()
+    rng = np.random.default_rng(n + 1)
+    z = rng.normal(size=n)
+    y = jnp.asarray(np.concatenate([[-0.5 * np.linalg.norm(z)], z]).astype(np.float32))
+    p = blk.conj_domain_project(y)
+    assert p.dtype == jnp.float32
+    assert bool(blk.conj_in_domain(p))
+    radius, spatial = -float(p[0]), _norm64(p[1:])
+    assert spatial <= radius
+    eps32 = float(np.finfo(np.float32).eps)
+    assert radius - spatial <= 32 * eps32 * radius
+    assert radius - spatial < (4 * n + 16) * eps32 * radius / 8

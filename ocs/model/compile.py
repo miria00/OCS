@@ -24,7 +24,8 @@ from ..prox.base import ProxBlock, _has_oracle
 from ..prox.library import SumSquares, Zero, NonNeg, GroupL2, L1
 from ..prox.cones import (ExpCone, ExpConeBatch, PowerCone, PowerConeBatch,
                           PSDCone, SecondOrderCone, SOCBatch,
-                          PSD_RESOLVED_SIGN_C as _PSD_RESOLVED_SIGN_C)
+                          PSD_RESOLVED_SIGN_C as _PSD_RESOLVED_SIGN_C,
+                          sym_eigvalsh as _sym_eigvalsh)
 from ..prox.groups import build_groups, grouped_moreau_dual
 from ..prox import block_metric as _block_metric
 from ..prox import cone_metric as _cone_metric
@@ -246,8 +247,9 @@ class Solution:
 ACCURACY_CRITERIA = ("objective_gap", "residual")
 
 # How the dual-correction rounds of the objective-bound evaluator apply each
-# block's interior safety adjustment (the second-order cones' inside-pull of
-# (4 k + 16) eps32 on the spatial part):
+# block's interior safety adjustment (the second-order cones' inside-pull on
+# the spatial part: 16 float32 ulps for SecondOrderCone since 0.3.8, and
+# (4 k + 16) eps32 for SOCBatch and for SecondOrderCone through 0.3.7):
 #   "compound": every round applies the block's ``conj_domain_project``, so a
 #               cone block is contracted once per round (32 rounds by default)
 #               whether or not the round corrected anything.  The behaviour
@@ -3617,7 +3619,7 @@ def compile_family(family, *, block=100, max_blocks=200, tol=1e-3,
                     symmetric = (unit + unit.T) * 0.5
                     skew = (unit - unit.T) * 0.5
                     interior = (jnp.max(jnp.abs(skew), initial=0.0) <= margin) & (
-                        jnp.min(jnp.linalg.eigvalsh(symmetric)) > margin)
+                        jnp.min(_sym_eigvalsh(symmetric)) > margin)
                     multiplier = value.reshape((blk.k, blk.k))
                     # PSD has relative interior in the symmetric subspace.
                     # Its normal contains skew matrices, even at a PD point.
@@ -4628,6 +4630,13 @@ def compile_family(family, *, block=100, max_blocks=200, tol=1e-3,
     _indicator_primal = (g_block is not None
                          and getattr(g_block, "is_indicator", False))
 
+    def _moved_norm(blk, v):
+        """||prox(v) - v||: the distance an indicator's projection moves v."""
+        distance = getattr(blk, "domain_distance", None)
+        if distance is not None:
+            return distance(v)
+        return stable_norm(blk.prox(v, jnp.ones_like(v)) - v)
+
     # ---- cone-aware dual recovery: a feasible anchor ---------------------
     # Eligible when the PRIMAL block g is a nonnegativity indicator, so that
     # dom g^* is the nonpositive orthant and the binding condition is the
@@ -4769,8 +4778,8 @@ def compile_family(family, *, block=100, max_blocks=200, tol=1e-3,
             eps = jnp.finfo(y.dtype).eps
             hmargin = 8*k*eps*jnp.max(jnp.sum(jnp.abs(h), axis=1))
             zmargin = 8*k*eps*jnp.max(jnp.sum(jnp.abs(z), axis=1))
-            hfloor = jnp.linalg.eigvalsh(h)[0]-hmargin
-            ceiling = jnp.linalg.eigvalsh(z)[-1]+zmargin
+            hfloor = _sym_eigvalsh(h)[0]-hmargin
+            ceiling = _sym_eigvalsh(z)[-1]+zmargin
             good = jnp.isfinite(hfloor) & (hfloor>0)
             t = jnp.maximum(0., ceiling/jnp.where(good, hfloor, 1.))
             t = t*(1+8*eps)
@@ -5001,20 +5010,21 @@ def compile_family(family, *, block=100, max_blocks=200, tol=1e-3,
             # pure relative convention used everywhere else in OCS: no
             # additive unit floor, so a right-hand side of 1e-6 does not make
             # a 1e-6 violation look small.
+            # A block that declares ``domain_distance`` (the PSD cone, since
+            # 0.3.8) reports the same distance from its spectrum instead of
+            # from a reconstructed projection.
             infeasibility = jnp.asarray(0.0, jnp.float32)
             if _indicator_blocks or _indicator_primal:
                 s_feas = matvec(x) + l
                 for blk, (a, bb) in _indicator_blocks:
                     si = s_feas[a:bb]
-                    moved = blk.prox(si, jnp.ones_like(si)) - si
                     infeasibility = jnp.maximum(
                         infeasibility,
-                        relative_ratio(stable_norm(moved), stable_norm(l[a:bb])))
+                        relative_ratio(_moved_norm(blk, si), stable_norm(l[a:bb])))
                 if _indicator_primal:
-                    moved = g_block.prox(x, jnp.ones_like(x)) - x
                     infeasibility = jnp.maximum(
                         infeasibility,
-                        relative_ratio(stable_norm(moved), stable_norm(x)))
+                        relative_ratio(_moved_norm(g_block, x), stable_norm(x)))
             kty_supplied = rmatvec(y)
             # What the SUPPLIED dual establishes on its own, and why not, before
             # any repair direction is tried.  A caller must be able to see that

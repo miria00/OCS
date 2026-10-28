@@ -1,5 +1,39 @@
 # Changes
 
+## 0.3.8 (2026-10-26; unpublished candidate)
+
+- The PSD cone never passes an exactly zero matrix to the eigensolver
+  (`ocs.prox.cones.sym_eigvalsh` and `sym_eigh`, used by `PSDCone`, the
+  cone-metric PSD projections and the evaluator's PSD anchor). Its spectrum
+  is zero, and the identity is an exact eigenbasis. On an RTX 5090 with JAX
+  0.11.1 the GPU eigensolver returned NaN for the zero matrix in some calls
+  and not others. The dual of a strictly feasible PSD block converges to
+  exactly zero, so the conjugate-domain test refused, nondeterministically,
+  the zero dual that had certified a Lyapunov solve at k = 64 to 512, and
+  `objective_bound(recover=False)` on the returned pair disagreed with the
+  solve. Every nonzero matrix takes the unchanged call, so its eigenvalues
+  and eigenvectors are bit-identical. The criterion is unchanged.
+
+- The second-order cone's conjugate-domain test also decides membership on
+  the represented float32 values in scoped float64, whose envelope
+  (2 n + 8) eps64 is negligible. The float32 envelope (2 n + 8) eps32 grows
+  with the cone dimension and is kept as a second sufficient test, so nothing
+  0.3.7 admitted is refused. The dual-witness projection forms its Moreau
+  residual in scoped float64 and pulls it 16 float32 ulps inside the polar
+  at every dimension, in place of (4 n + 16) eps32. Through 0.3.7 that pull
+  lowered the certified bound by about (4 n + 16) eps32 s / |p*| relative,
+  with s the cone multiplier, which reached 1.5e-4 to 2.4e-4 at n = 512 and
+  kept that family from meeting tol 1e-4. SOCBatch is unchanged. The
+  criterion, its normalizations and the acceptance decision are unchanged.
+- The relative primal feasibility of a PSD block is read from float64
+  eigenvalues of the represented float32 slack,
+  sqrt(||skew||_F^2 + ||min(lambda, 0)||_2^2), with each eigenvalue lowered by
+  8 k eps64 max|lambda| and the result rounded upward
+  (`PSDCone.domain_distance`). Through 0.3.7 it was the norm of a float32
+  reconstructed projection minus the slack, whose reconstruction error alone
+  read 4e-6 to 3e-5 on strictly interior Lyapunov slacks at k = 1024 and 2048,
+  the size of tol 1e-5. Other blocks keep the projection-based measure.
+
 ## 0.3.7 (2026-10-23; unpublished candidate)
 
 - Prepared scalar and batched quadratic OT register the RTX 5090 metadata

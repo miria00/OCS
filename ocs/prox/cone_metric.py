@@ -60,6 +60,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import block_metric as _bm
+from .cones import sym_eigh as _sym_eigh
 
 KIND = "automorphism"
 ALGEBRAS = ("soc", "psd")
@@ -245,7 +246,7 @@ def apply_psd(A, R):
 
 def psd_spectral(S, fn):
     S = 0.5 * (S + jnp.swapaxes(S, -1, -2))
-    values, vectors = jnp.linalg.eigh(S)
+    values, vectors = _sym_eigh(S)
     out = _mm(vectors * fn(values)[..., None, :], jnp.swapaxes(vectors, -1, -2))
     return 0.5 * (out + jnp.swapaxes(out, -1, -2))
 
@@ -270,7 +271,7 @@ def soc_project(R):
 def psd_project(M):
     """Euclidean projection onto S^k_+ of every (k, k) slice of M (count, k, k)."""
     M = 0.5 * (M + jnp.swapaxes(M, -1, -2))
-    _, U = jnp.linalg.eigh(M)
+    _, U = _sym_eigh(M)
     U = U / jnp.sqrt(jnp.sum(U * U, axis=-2, keepdims=True))
     MU = _mm(M, U)
     w = jnp.sum(U * MU, axis=-2)

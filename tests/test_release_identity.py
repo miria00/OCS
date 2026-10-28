@@ -11,7 +11,7 @@ from importlib.metadata import version
 import ocs
 from ocs.model.compile import ACCEPTANCE_POLICY_ID
 
-RELEASE = "0.3.7"
+RELEASE = "0.3.8"
 
 
 def test_import_version_equals_distribution_version():

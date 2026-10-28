@@ -27,6 +27,38 @@ _TOL = 1e-7
 PSD_RESOLVED_SIGN_C = 2.0
 
 
+def _zero_slices(S):
+    return jnp.all(S == 0, axis=(-2, -1))
+
+
+def sym_eigvalsh(S):
+    """``jnp.linalg.eigvalsh`` of symmetric (..., k, k) slices, exact on zero slices.
+
+    The GPU eigensolver can return NaN for an exactly zero matrix, in some
+    calls and not in others (RTX 5090, JAX 0.11.1, 2026-10-27), and the dual
+    of a strictly feasible PSD block converges to exactly zero.  The spectrum
+    of a zero slice is known, so the eigensolver never sees one: an identity
+    stands in and its eigenvalues are replaced by zeros.  Every other slice
+    takes the unchanged call, so its eigenvalues are bit-identical.
+    """
+    zero = _zero_slices(S)
+    eye = jnp.eye(S.shape[-1], dtype=S.dtype)
+    w = jnp.linalg.eigvalsh(jnp.where(zero[..., None, None], eye, S))
+    return jnp.where(zero[..., None], jnp.zeros_like(w), w)
+
+
+def sym_eigh(S):
+    """``jnp.linalg.eigh`` of symmetric (..., k, k) slices, exact on zero slices.
+
+    As ``sym_eigvalsh``. A zero slice returns zero eigenvalues and the
+    identity basis, an exact eigendecomposition of the zero matrix.
+    """
+    zero = _zero_slices(S)
+    eye = jnp.eye(S.shape[-1], dtype=S.dtype)
+    w, U = jnp.linalg.eigh(jnp.where(zero[..., None, None], eye, S))
+    return jnp.where(zero[..., None], jnp.zeros_like(w), w), U
+
+
 # =====================================================================
 # Second-order cone  { (s, z) : ||z||_2 <= s }   (s is the first entry)
 # =====================================================================
@@ -65,6 +97,40 @@ def _conservative_norm_leq(z, radius, axis=0):
                   & ((rb == 0) | (rb >= 0x00800000)))
     return (jnp.all(jnp.isfinite(z), axis=axis) & jnp.isfinite(radius)
             & normal & (radius >= 0) & (interior | axis_exact | integer_exact))
+
+
+#: Float32 ulps by which ``SecondOrderCone.conj_domain_project`` pulls the
+#: spatial part of a float32 proposal inside the polar (since 0.3.8).  The
+#: Moreau residual is formed in scoped float64 and rounded once, so it lies
+#: within about one ulp of the boundary; 16 ulps clear the float64 membership
+#: test below at every dimension.
+SOC_INSIDE_PULL_ULPS = 16
+
+
+def _float64_norm_leq(z, radius, axis=0):
+    """``_conservative_norm_leq`` decided on the represented float32 values in
+    scoped float64 (since 0.3.8).
+
+    A float32 value converts to float64 exactly, so the test is the same
+    sufficient test on the same numbers, with the envelope (2 n + 8) eps64 in
+    place of (2 n + 8) eps32.  The float32 envelope grows with the dimension:
+    at n = 512 it is 1.2e-4, larger than the tolerances the objective bound is
+    asked to certify.  The float32 subnormal refusal is kept, decided on the
+    stored bits before the conversion.  The barrier keeps XLA from re-deriving
+    z at higher precision, as in ``PSDCone.conj_in_domain_resolved``.
+    Float64 inputs are decided by ``_conservative_norm_leq`` unchanged.
+    """
+    if z.dtype != jnp.float32:
+        return _conservative_norm_leq(z, radius, axis)
+    bits = jax.lax.bitcast_convert_type(z, jnp.uint32) & jnp.uint32(0x7fffffff)
+    rb = jax.lax.bitcast_convert_type(radius, jnp.uint32) & jnp.uint32(0x7fffffff)
+    normal = (jnp.all((bits == 0) | (bits >= 0x00800000), axis=axis)
+              & ((rb == 0) | (rb >= 0x00800000)))
+    with jax.enable_x64():
+        z64 = jax.lax.optimization_barrier(z).astype(jnp.float64)
+        r64 = jax.lax.optimization_barrier(radius).astype(jnp.float64)
+        ok = _conservative_norm_leq(z64, r64, axis)
+    return normal & ok
 
 
 class SecondOrderCone(ProxBlock):
@@ -107,7 +173,10 @@ class SecondOrderCone(ProxBlock):
         return jnp.concatenate([jnp.reshape(proj_s, (1,)), proj_z])
 
     def conj_in_domain(self, y):
-        return _conservative_norm_leq(y[1:], -y[0])
+        # Either sufficient test admits: the float32 envelope, or the same
+        # test on the represented values in scoped float64 (since 0.3.8).
+        return (_conservative_norm_leq(y[1:], -y[0])
+                | _float64_norm_leq(y[1:], -y[0]))
 
     def conj_domain_radius(self, y):
         # dom f^* is a cone: every positive multiple of a member is a member,
@@ -118,11 +187,22 @@ class SecondOrderCone(ProxBlock):
         # Moreau: y = P_K(y) + P_{-K}(y), so the projection onto the polar is
         # the residual of the Euclidean projection onto K.  That residual lies
         # ON the boundary ||p[1:]|| = -p[0], where the exact membership test is
-        # decided by float32 rounding and differs between backends.  The
-        # proposal is therefore pulled a few ulps INSIDE the polar by shrinking
-        # the spatial part; it is a proposal, re-checked exactly by the caller.
-        p = y - self._project(y)
-        shrink = jnp.maximum(0., 1.0 - (4 * (y.size-1) + 16) * jnp.finfo(y.dtype).eps)
+        # decided by rounding and differs between backends.  The proposal is
+        # therefore pulled a few ulps INSIDE the polar by shrinking the
+        # spatial part; it is a proposal, re-checked exactly by the caller.
+        # For float32 data the residual is formed in scoped float64 and the
+        # pull is SOC_INSIDE_PULL_ULPS ulps at every dimension (since 0.3.8).
+        # Through 0.3.7 it was formed in float32 and pulled (4 n + 16) eps32,
+        # which lowers the dual bound by about (4 n + 16) eps32 s / |p*|
+        # relative, with s the cone multiplier: 1.5e-4 at n = 512.
+        if y.dtype == jnp.float32:
+            with jax.enable_x64():
+                y64 = jax.lax.optimization_barrier(y).astype(jnp.float64)
+                p = (y64 - self._project(y64)).astype(jnp.float32)
+            shrink = jnp.float32(1.0 - SOC_INSIDE_PULL_ULPS * float(jnp.finfo(jnp.float32).eps))
+        else:
+            p = y - self._project(y)
+            shrink = jnp.maximum(0., 1.0 - (4 * (y.size-1) + 16) * jnp.finfo(y.dtype).eps)
         return jnp.concatenate([p[:1], p[1:] * shrink])
 
     def conj_domain_project_exact(self, y):
@@ -151,7 +231,7 @@ class PSDCone(ProxBlock):
         k = self.k
         M = v.reshape(k, k)
         M = 0.5 * (M + M.T)
-        _, U = jnp.linalg.eigh(M)
+        _, U = sym_eigh(M)
         # Repair eigenpair roundoff before clipping. Small primal steps can
         # amplify GPU eigenvector norm and eigenvalue errors during PDHG.
         U = U / jnp.sqrt(jnp.sum(U * U, axis=0))
@@ -165,7 +245,7 @@ class PSDCone(ProxBlock):
 
     def value(self, z):
         M = z.reshape(self.k, self.k)
-        w = jnp.linalg.eigvalsh(0.5 * (M + M.T))
+        w = sym_eigvalsh(0.5 * (M + M.T))
         return jnp.where(jnp.min(w) >= -1e-4, 0.0, jnp.inf)
 
     def conj_value(self, y):                       # polar = negative self-dual cone
@@ -177,7 +257,7 @@ class PSDCone(ProxBlock):
         # This spectral test has no feasibility slack; it is still a numerical
         # evaluation, not a rigorous real-arithmetic eigenvalue enclosure.
         M = y.reshape(self.k, self.k)
-        return jnp.all(jnp.isfinite(y)) & (jnp.max(jnp.linalg.eigvalsh(0.5 * (M + M.T))) <= 0)
+        return jnp.all(jnp.isfinite(y)) & (jnp.max(sym_eigvalsh(0.5 * (M + M.T))) <= 0)
 
     #: The objective-bound evaluator decides this block's membership with
     #: ``conj_in_domain_resolved`` (see ``ocs.model.compile``).
@@ -206,7 +286,7 @@ class PSDCone(ProxBlock):
             y32 = y.astype(jnp.float32)
             y64 = jax.lax.optimization_barrier(y32).astype(jnp.float64)
             M = y64.reshape(k, k)
-            w = jnp.linalg.eigvalsh(0.5 * (M + M.T))
+            w = sym_eigvalsh(0.5 * (M + M.T))
             resolved = jnp.all(jnp.isfinite(w)) & (w[-1] <= -gamma * jnp.max(jnp.abs(w)))
         return admitted & resolved
 
@@ -216,7 +296,7 @@ class PSDCone(ProxBlock):
     def conj_domain_project(self, y):
         M = y.reshape(self.k, self.k)
         sym = 0.5 * (M + M.T)
-        w, U = jnp.linalg.eigh(sym)
+        w, U = sym_eigh(sym)
         negative = jnp.matmul(U * jnp.minimum(w, 0.0), U.T,
                               precision=jax.lax.Precision.HIGHEST)
         negative = 0.5 * (negative + negative.T)
@@ -225,6 +305,34 @@ class PSDCone(ProxBlock):
         margin = 8 * self.k * jnp.finfo(y.dtype).eps * jnp.max(jnp.abs(w))
         negative -= margin * jnp.eye(self.k, dtype=y.dtype)
         return (negative + 0.5 * (M - M.T)).reshape(-1)
+
+    def domain_distance(self, v):
+        # ||P(v) - v||_F, the distance the projection moves v, for the
+        # objective-bound evaluator's relative primal feasibility (since
+        # 0.3.8).  With M = v as a k x k matrix, P(M) - M is the skew part
+        # minus U min(lambda, 0) U^T of the symmetric part, two orthogonal
+        # pieces, so the distance is
+        #     sqrt(||skew M||_F^2 + ||min(lambda(sym M), 0)||_2^2).
+        # It is read from eigenvalues in scoped float64 on the represented
+        # float32 values, never from a reconstructed projection: in float32
+        # the reconstruction alone moves a strictly interior k = 1024 matrix
+        # by about 1e-5 relative.  Each eigenvalue is lowered by the envelope
+        # 8 k eps64 max|lambda| before clipping, so the distance is not
+        # understated, and the float32 result is rounded upward.
+        k = self.k
+        with jax.enable_x64():
+            v64 = jax.lax.optimization_barrier(v.astype(jnp.float32)).astype(jnp.float64)
+            M = v64.reshape(k, k)
+            skew = 0.5 * (M - M.T)
+            w = sym_eigvalsh(0.5 * (M + M.T))
+            envelope = 8 * k * float(jnp.finfo(jnp.float64).eps) * jnp.max(jnp.abs(w))
+            negative = jnp.minimum(w - envelope, 0.0)
+            d64 = jnp.sqrt(jnp.sum(skew * skew) + jnp.sum(negative * negative))
+            d32 = d64.astype(jnp.float32)
+            d32 = jnp.where(d32.astype(jnp.float64) < d64,
+                            jnp.nextafter(d32, jnp.float32(jnp.inf)), d32)
+            d32 = jnp.where(jnp.all(jnp.isfinite(v64)), d32, jnp.float32(jnp.inf))
+        return d32
 
     def group_key(self):
         return ("PSDCone", self.k)
