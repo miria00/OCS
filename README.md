@@ -1,5 +1,7 @@
 # OCS: Operator-Native Convex Solver
 
+## Software and paper release to follow shortly
+
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 OCS is a numerical optimization package for solving large-scale convex
